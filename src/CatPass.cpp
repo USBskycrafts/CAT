@@ -64,8 +64,8 @@ namespace {
         if(isa<PHINode>(first_Op)) {
           auto phi = cast<PHINode>(first_Op);
           for(unsigned i = 0; i < phi->getNumOperands(); i++) {
-            if(isa<Instruction>(phi->getOperand(i))) {
-              label_set[inst_label[cast<Instruction>(phi->getOperand(i))]] |= inst_bitvector[inst];
+            if(isa<CallInst>(phi->getOperand(i))) {
+              label_set[inst_label[cast<CallInst>(phi->getOperand(i))]] |= inst_bitvector[inst];
             }
           }
         } else {
@@ -83,18 +83,26 @@ namespace {
         bit_vec = label_set[inst_label[inst]];
         gen[inst] = inst_bitvector[inst];
       } else if(CAT_Function.count(fun_name)) {
-        CallInst *cal_inst = cast<CallInst>(inst->getOperand(0));
-        bit_vec = label_set[inst_label[cal_inst]];
+        auto cat_new = inst->getOperand(0);
+        if(auto phi = dyn_cast<PHINode>(cat_new)) {
+          //errs() << *inst << " " << *phi << "\n";
+          for(unsigned i = 0; i < phi->getNumOperands(); i++) {
+            auto cat_new = phi->getOperand(i);
+            //errs() << *cat_new << "\n";
+            if(auto call_new = dyn_cast<CallInst>(cat_new)) {
+              bit_vec |= label_set[inst_label[call_new]];
+            }
+          }
+        } else {
+          CallInst *cal_inst = cast<CallInst>(inst->getOperand(0));
+          bit_vec = label_set[inst_label[cal_inst]];
+        }
         gen[inst] = inst_bitvector[inst];
       } else {
         gen[inst] = BitVector(inst_count, false);
       }
 
-
-      if(fun_name == "CAT_new") {
-        bit_vec ^= inst_bitvector[inst];
-        kill[inst] = bit_vec;
-      } else if(CAT_Function.count(fun_name)) {
+      if(CAT_Function.count(fun_name)) {
         bit_vec ^= inst_bitvector[inst];
         kill[inst] = bit_vec;
       } else {
@@ -161,7 +169,15 @@ namespace {
 
     void printInAndOut(Function &F) {
       for(auto &inst : instructions(F)) {
-        auto in_bit = in[&inst];
+        /**
+        auto gen_bit = gen[&inst];
+        for(unsigned i = 0; i < gen_bit.size(); i++) errs() << gen_bit[i];
+        errs() << "\n";
+        auto kill_bit = kill[&inst];
+        for(unsigned i = 0; i < kill_bit.size(); i++) errs() << kill_bit[i];;
+        errs() << "\n";
+        **/
+        auto in_bit = in[&inst]; 
         errs() << "INSTRUCTION: " << inst << "\n";
         errs() << "***************** IN\n{\n";
         for(unsigned i = 0; i < in_bit.size(); i++) {
