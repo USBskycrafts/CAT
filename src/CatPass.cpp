@@ -86,12 +86,13 @@ namespace {
         auto cat_new = inst->getOperand(0);
         if(auto phi = dyn_cast<PHINode>(cat_new)) {
           //errs() << *inst << " " << *phi << "\n";
+          bit_vec |= inst_bitvector[inst];
           for(unsigned i = 0; i < phi->getNumOperands(); i++) {
             auto cat_new = phi->getOperand(i);
             //errs() << *cat_new << "\n";
             if(auto call_new = dyn_cast<CallInst>(cat_new)) {
-              bit_vec |= label_set[inst_label[call_new]];
-            }
+              //bit_vec |= label_set[inst_label[call_new]];
+            } 
           }
         } else {
           CallInst *cal_inst = cast<CallInst>(inst->getOperand(0));
