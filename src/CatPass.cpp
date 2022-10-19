@@ -1,8 +1,11 @@
 #include "llvm/Pass.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/Casting.h"
@@ -16,6 +19,7 @@
 #include <vector>
 #include <map>
 #include <unordered_map>
+#define func_name getCalledFunction()->getName()
 using namespace llvm;
 using namespace std;
 
@@ -85,11 +89,9 @@ namespace {
       } else if(CAT_Function.count(fun_name)) {
         auto cat_new = inst->getOperand(0);
         if(auto phi = dyn_cast<PHINode>(cat_new)) {
-          //errs() << *inst << " " << *phi << "\n";
           bit_vec |= inst_bitvector[inst];
           for(unsigned i = 0; i < phi->getNumOperands(); i++) {
             auto cat_new = phi->getOperand(i);
-            //errs() << *cat_new << "\n";
             if(auto call_new = dyn_cast<CallInst>(cat_new)) {
               //bit_vec |= label_set[inst_label[call_new]];
             } 
@@ -137,25 +139,6 @@ namespace {
         out_bit &= kill_bit.flip();
         in[inst] = in_bit;
         out[inst] = out_bit;
-        /**
-        errs() << *inst << "\n" ;
-        for(int i = 0; i < gen[inst].size(); i++) {
-          errs() << gen[inst][i];
-        }
-        errs() << "\n";
-        for(int i = 0; i < kill[inst].size(); i++) {
-          errs() << kill[inst][i];
-        }
-        errs() << "\n";
-        for(int i = 0; i < in[inst].size(); i++) {
-          errs() << in[inst][i];
-        }
-        errs() << "\n";
-        for(int i = 0; i < out[inst].size(); i++) {
-          errs() << out[inst][i];
-        }
-        errs() << "\n";
-        **/
         if(out_bit != oldOut) {
           if(inst == bb->getTerminator()) {
               for(auto next : successors(bb)) {
@@ -170,14 +153,6 @@ namespace {
 
     void printInAndOut(Function &F) {
       for(auto &inst : instructions(F)) {
-        /**
-        auto gen_bit = gen[&inst];
-        for(unsigned i = 0; i < gen_bit.size(); i++) errs() << gen_bit[i];
-        errs() << "\n";
-        auto kill_bit = kill[&inst];
-        for(unsigned i = 0; i < kill_bit.size(); i++) errs() << kill_bit[i];;
-        errs() << "\n";
-        **/
         auto in_bit = in[&inst]; 
         errs() << "INSTRUCTION: " << inst << "\n";
         errs() << "***************** IN\n{\n";
@@ -193,10 +168,59 @@ namespace {
         errs() << "}\n**************************************\n\n\n\n";
       }
     }
+
+    void optimizeFunction(Function &F) {
+      queue<CallInst*> work_list;
+      for(auto &inst : instructions(F)) {
+        if(auto cal_inst = dyn_cast<CallInst>(&inst)) {
+          work_list.push(cal_inst);
+        }
+      }
+      
+      do {
+        auto cal_inst = work_list.front();
+        work_list.pop();
+        StringRef f_name = cal_inst->func_name;
+        if(f_name == "CAT_set") {
+          auto const_num = cal_inst->getOperand(1);
+          if(isa<Instruction>(const_num)) {
+            auto cal_num = dyn_cast<CallInst>(const_num);
+            if(cal_num && cal_num->func_name == "CAT_new") {
+              BitVector in_set =  in[cal_inst];
+              if(in_set[inst_label[cal_num]] == 1) {
+                auto num = cast<ConstantInt>(cal_num->getOperand(0));
+                cal_inst->replaceAllUsesWith(num);
+                cal_inst->eraseFromParent();
+              }
+            }
+          } else if(isa<ConstantInt>(const_num)) {
+            cal_inst->replaceAllUsesWith(cast<ConstantInt>(const_num));
+          }
+        } else if(f_name == "CAT_get") {
+          auto const_num = cal_inst->getOperand(0);
+          if(isa<Instruction>(const_num)) {
+            auto cal_num = dyn_cast<CallInst>(const_num);
+            BitVector in_set = in[cal_inst];
+            if(in_set[inst_label[cal_num]] == 1) {
+              auto num = cast<ConstantInt>(cal_num->getOperand(0));
+              for(auto user : cal_inst->users()) {
+                if(isa<CallInst>(user)) {
+                  work_list.push(cast<CallInst>(user));
+                }
+              }
+              cal_inst->replaceAllUsesWith(num);
+              cal_inst->eraseFromParent();
+            }
+          }  else if(isa<ConstantInt>(const_num)) {
+            cal_inst->replaceAllUsesWith(cast<ConstantInt>(const_num));
+            cal_inst->eraseFromParent();
+          }
+        }
+      } while(!work_list.empty());
+    }
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction (Function &F) override {
-      errs() << "Function \"" << F.getName() << "\" \n";
       for(auto &inst : instructions(F)) {
         if(isa<CallInst>(inst)) {
           CallInst &cal_inst = cast<CallInst>(inst);
@@ -214,8 +238,8 @@ namespace {
           setGenAndKill(&inst);
       }
       setInAndOut(F);
-      printInAndOut(F);
-      return false;
+      optimizeFunction(F);
+      return true;
     }
 
     // We don't modify the program, so we preserve all analyses.
