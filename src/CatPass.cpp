@@ -115,6 +115,13 @@ namespace {
 
     
     void setInAndOut(Function &F) {
+      in.clear();
+      out.clear();
+      gen.clear();
+      kill.clear();
+      for(auto &inst : instructions(F)) {
+          setGenAndKill(&inst);
+      }
       for(auto &inst : instructions(F)) {
         q.push(&inst);
       } 
@@ -181,39 +188,86 @@ namespace {
         auto cal_inst = work_list.front();
         work_list.pop();
         StringRef f_name = cal_inst->func_name;
-        if(f_name == "CAT_set") {
-          auto const_num = cal_inst->getOperand(1);
-          if(isa<Instruction>(const_num)) {
-            auto cal_num = dyn_cast<CallInst>(const_num);
-            if(cal_num && cal_num->func_name == "CAT_new") {
-              BitVector in_set =  in[cal_inst];
-              if(in_set[inst_label[cal_num]] == 1) {
-                auto num = cast<ConstantInt>(cal_num->getOperand(0));
-                cal_inst->replaceAllUsesWith(num);
+        if(f_name == "CAT_get") {
+          auto d1 = cast<CallInst>(cal_inst->getOperand(0));
+          BitVector in1 = in[cal_inst], d1_set = label_set[inst_label[d1]];
+          d1_set &= in1;
+          for(unsigned i = 0; i < inst_count; i++) {
+            if(d1_set[i] == 1) {
+              StringRef name = cast<CallInst>(label_inst[i])->func_name;
+              if(name == "CAT_new") {
+                cal_inst->replaceAllUsesWith(cast<ConstantInt>(label_inst[i]->getOperand(0)));
+                cal_inst->eraseFromParent();
+              } else if(name == "CAT_add" || name == "CAT_sub") {
+                if(isa<ConstantInt>(label_inst[i]->getOperand(1)) && isa<ConstantInt>(label_inst[i]->getOperand(2))) {
+                  if(name == "CAT_add") {
+                    auto const1 = cast<ConstantInt>(label_inst[i]->getOperand(1))->getSExtValue();
+                    auto const2 = cast<ConstantInt>(label_inst[i]->getOperand(2))->getSExtValue();
+                    auto result = ConstantInt::get(label_inst[i]->getType(), const1 + const2);
+                    cal_inst->replaceAllUsesWith(result);
+                    cal_inst->eraseFromParent();
+                  } else {
+                    auto const1 = cast<ConstantInt>(label_inst[i]->getOperand(1))->getSExtValue();
+                    auto const2 = cast<ConstantInt>(label_inst[i]->getOperand(2))->getSExtValue();
+                    auto result = ConstantInt::get(label_inst[i]->getType(), const1 - const2);
+                    cal_inst->replaceAllUsesWith(result);
+                    cal_inst->eraseFromParent();
+                  }
+                }
+              } else if(name == "CAT_set") {
+                cal_inst->replaceAllUsesWith(cast<ConstantInt>(label_inst[i]->getOperand(1)));
                 cal_inst->eraseFromParent();
               }
             }
-          } else if(isa<ConstantInt>(const_num)) {
-            cal_inst->replaceAllUsesWith(cast<ConstantInt>(const_num));
           }
-        } else if(f_name == "CAT_get") {
-          auto const_num = cal_inst->getOperand(0);
-          if(isa<Instruction>(const_num)) {
-            auto cal_num = dyn_cast<CallInst>(const_num);
-            BitVector in_set = in[cal_inst];
-            if(in_set[inst_label[cal_num]] == 1) {
-              auto num = cast<ConstantInt>(cal_num->getOperand(0));
-              for(auto user : cal_inst->users()) {
-                if(isa<CallInst>(user)) {
-                  work_list.push(cast<CallInst>(user));
+        } else if(f_name == "CAT_add" || f_name == "CAT_sub") {
+          auto v1 = cal_inst->getOperand(1), v2 = cal_inst->getOperand(2);
+          errs() << "1:" << cal_inst << " " << *cal_inst << "\n";
+          unordered_set<ConstantInt*> const_num1, const_num2;
+          if(auto d1 = dyn_cast<CallInst>(v1)) {
+            BitVector in1 = in[cal_inst], d1_set = label_set[inst_label[d1]];
+            d1_set &= in1;
+            for(unsigned i  = 0; i < inst_count; i++) {
+              if(d1_set[i] == 1) {
+                StringRef name = cast<CallInst>(label_inst[i])->func_name;
+                if(name == "CAT_new") {
+                  const_num1.insert(cast<ConstantInt>(label_inst[i]->getOperand(0)));
+                } else if(name == "CAT_set") {
+                  const_num1.insert(cast<ConstantInt>(label_inst[i]->getOperand(1)));
                 }
               }
-              cal_inst->replaceAllUsesWith(num);
-              cal_inst->eraseFromParent();
             }
-          }  else if(isa<ConstantInt>(const_num)) {
-            cal_inst->replaceAllUsesWith(cast<ConstantInt>(const_num));
-            cal_inst->eraseFromParent();
+          }
+          if(auto d2 = dyn_cast<CallInst>(v2)) {
+            BitVector in2 = in[cal_inst], d2_set = label_set[inst_label[d2]];
+            d2_set &= in2;
+            for(unsigned i = 0; i < inst_count; i++) {
+              if(d2_set[i] == 1) {
+                StringRef name = cast<CallInst>(label_inst[i])->func_name;
+                if(name == "CAT_new") {
+                  const_num2.insert(cast<ConstantInt>(label_inst[i]->getOperand(0)));
+                } else if(name == "CAT_set") {
+                  const_num2.insert(cast<ConstantInt>(label_inst[i]->getOperand(1)));
+                }
+              }
+            }
+            
+          }
+          if(const_num1.size() == 1 && const_num2.size() == 1)  {
+              Value* result;
+              IRBuilder<> builder(cal_inst);
+              if(f_name == "CAT_add") {
+                result = builder.CreateAdd(*const_num1.begin(), *const_num2.begin());
+              } else {
+                result = builder.CreateSub(*const_num1.begin(), *const_num2.begin());
+              }
+              auto call = builder.CreateCall(F.getParent()->getFunction("CAT_set"), {
+                cal_inst->getOperand(0),
+                result
+              });
+              dyn_cast<CallInst>(call)->setTailCall();
+              errs() << "2:" << call << " " << *call << "\n";
+              cal_inst->eraseFromParent();
           }
         }
       } while(!work_list.empty());
@@ -234,12 +288,10 @@ namespace {
           setCluster(&cal_inst);
         }
       }
-      for(auto &inst : instructions(F)) {
-          setGenAndKill(&inst);
-      }
+      
       setInAndOut(F);
       optimizeFunction(F);
-      return true;
+      return false;
     }
 
     // We don't modify the program, so we preserve all analyses.
