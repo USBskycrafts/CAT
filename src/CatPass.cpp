@@ -188,7 +188,7 @@ namespace {
         auto cal_inst = work_list.front();
         work_list.pop();
         StringRef f_name = cal_inst->func_name;
-        if(f_name == "CAT_get") {
+        if(f_name == "CAT_get" && isa<CallInst>(cal_inst->getOperand(0))) {
           auto d1 = cast<CallInst>(cal_inst->getOperand(0));
           BitVector in1 = in[cal_inst], d1_set = label_set[inst_label[d1]];
           d1_set &= in1;
@@ -215,14 +215,15 @@ namespace {
                   }
                 }
               } else if(name == "CAT_set") {
-                cal_inst->replaceAllUsesWith(cast<ConstantInt>(label_inst[i]->getOperand(1)));
-                cal_inst->eraseFromParent();
+                if(isa<ConstantInt>(label_inst[i]->getOperand(1))) {
+                  cal_inst->replaceAllUsesWith(cast<ConstantInt>(label_inst[i]->getOperand(1)));
+                  cal_inst->eraseFromParent();
+                }
               }
             }
           }
         } else if(f_name == "CAT_add" || f_name == "CAT_sub") {
           auto v1 = cal_inst->getOperand(1), v2 = cal_inst->getOperand(2);
-          errs() << "1:" << cal_inst << " " << *cal_inst << "\n";
           unordered_set<ConstantInt*> const_num1, const_num2;
           if(auto d1 = dyn_cast<CallInst>(v1)) {
             BitVector in1 = in[cal_inst], d1_set = label_set[inst_label[d1]];
@@ -230,9 +231,9 @@ namespace {
             for(unsigned i  = 0; i < inst_count; i++) {
               if(d1_set[i] == 1) {
                 StringRef name = cast<CallInst>(label_inst[i])->func_name;
-                if(name == "CAT_new") {
+                if(name == "CAT_new" && isa<ConstantInt>(label_inst[i]->getOperand(0))) {
                   const_num1.insert(cast<ConstantInt>(label_inst[i]->getOperand(0)));
-                } else if(name == "CAT_set") {
+                } else if(name == "CAT_set" && isa<ConstantInt>(label_inst[i]->getOperand(1))) {
                   const_num1.insert(cast<ConstantInt>(label_inst[i]->getOperand(1)));
                 }
               }
@@ -244,9 +245,9 @@ namespace {
             for(unsigned i = 0; i < inst_count; i++) {
               if(d2_set[i] == 1) {
                 StringRef name = cast<CallInst>(label_inst[i])->func_name;
-                if(name == "CAT_new") {
+                if(name == "CAT_new" && isa<ConstantInt>(label_inst[i]->getOperand(0))) {
                   const_num2.insert(cast<ConstantInt>(label_inst[i]->getOperand(0)));
-                } else if(name == "CAT_set") {
+                } else if(name == "CAT_set" && isa<ConstantInt>(label_inst[i]->getOperand(1))) {
                   const_num2.insert(cast<ConstantInt>(label_inst[i]->getOperand(1)));
                 }
               }
@@ -266,9 +267,10 @@ namespace {
                 result
               });
               dyn_cast<CallInst>(call)->setTailCall();
-              errs() << "2:" << call << " " << *call << "\n";
               cal_inst->eraseFromParent();
           }
+        } else if(f_name == "CAT_set") {
+          
         }
       } while(!work_list.empty());
     }
@@ -290,6 +292,7 @@ namespace {
       }
       
       setInAndOut(F);
+      printInAndOut(F);
       optimizeFunction(F);
       return false;
     }
