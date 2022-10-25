@@ -72,9 +72,27 @@ namespace {
               label_set[inst_label[cast<CallInst>(phi->getOperand(i))]] |= inst_bitvector[inst];
             }
           }
-        } else {
+        } else if(isa<CallInst>(first_Op) && cast<CallInst>(first_Op)->func_name == "CAT_new") {
             auto origin_inst = cast<Instruction>(inst->getArgOperand(0));
             label_set[inst_label[origin_inst]] |= inst_bitvector[inst];
+        }
+      } else if(fun_name != "CAT_get"){ //arbitrary function
+        //errs() << *inst << "--------1\n";
+        unsigned n = inst->getNumOperands();
+        for(unsigned i = 0; i < n; i++) {
+          auto op = inst->getOperand(i);
+          //errs() << *op << "-------2\n\n\n";
+          if(isa<CallInst>(op) && CAT_Function.count(cast<CallInst>(op)->func_name)) {
+            auto cat_inst = cast<CallInst>(op);
+            if(cat_inst->func_name == "CAT_new") {
+              label_set[inst_label[cat_inst]] |= inst_bitvector[inst];
+            } else if(CAT_Function.count(cat_inst->func_name)) {
+              auto cat_new = dyn_cast<CallInst>(cat_inst->getOperand(0));
+              if(cat_new && cat_new->func_name == "CAT_new") {
+                label_set[inst_label[cat_new]] |= inst_bitvector[inst];
+              }
+            }
+          }
         }
       }
     }
@@ -82,6 +100,7 @@ namespace {
     void setGenAndKill(Instruction *inst) {
       StringRef fun_name;
       if(isa<CallInst>(inst)) fun_name = cast<CallInst>(inst)->getCalledFunction()->getName();
+      else return;
       BitVector bit_vec(inst_count, false); 
       if(fun_name == "CAT_new") {
         bit_vec = label_set[inst_label[inst]];
@@ -96,13 +115,21 @@ namespace {
               //bit_vec |= label_set[inst_label[call_new]];
             } 
           }
-        } else {
+        } else if(isa<CallInst>(inst->getOperand(0))) {
           CallInst *cal_inst = cast<CallInst>(inst->getOperand(0));
           bit_vec = label_set[inst_label[cal_inst]];
         }
         gen[inst] = inst_bitvector[inst];
-      } else {
-        gen[inst] = BitVector(inst_count, false);
+      } else if(fun_name != "CAT_get") {
+        unsigned n = inst->getNumOperands();
+        for(unsigned i = 0; i < n; i++) {
+          auto inst_op = inst->getOperand(i);
+          if(isa<CallInst>(inst_op) && (cast<CallInst>(inst_op)->func_name == "CAT_new")) {
+            gen[inst] = inst_bitvector[inst];
+            //bit_vec = label_set[inst_label[cast<CallInst>(inst_op)]];
+            //kill[inst] = (bit_vec ^= gen[inst]);
+          } 
+        }
       }
 
       if(CAT_Function.count(fun_name)) {
@@ -180,7 +207,7 @@ namespace {
           work_list.push(cal_inst);
         }
       }
-      
+      if(work_list.empty()) return;
       do {
         auto cal_inst = work_list.front();
         work_list.pop();
@@ -196,7 +223,7 @@ namespace {
           }
           for(unsigned i = 0; i < inst_count; i++) {
             if(d1_set[i] == 1) {
-              StringRef name = cast<CallInst>(label_inst[i])->func_name;
+              StringRef name = dyn_cast<CallInst>(label_inst[i])->func_name;
               if(name == "CAT_new") {
                 auto result = dyn_cast<ConstantInt>(label_inst[i]->getOperand(0));
                 if(result) {
@@ -239,19 +266,25 @@ namespace {
               cal_inst->replaceAllUsesWith(*result_set.begin());
               cal_inst->eraseFromParent();
           }
-        } else if((f_name == "CAT_add" || f_name == "CAT_sub") && isa<CallInst>(cal_inst->getOperand(0))) {
+        } else if((f_name == "CAT_add" || f_name == "CAT_sub")) {
           auto v1 = cal_inst->getOperand(1), v2 = cal_inst->getOperand(2);
           unordered_set<ConstantInt*> const_num1, const_num2;
+          int in_count1 = 0, in_count2 = 0;
           if(auto d1 = dyn_cast<CallInst>(v1)) {
             BitVector in1 = in[cal_inst], d1_set = label_set[inst_label[d1]];
             d1_set &= in1;
+            for(unsigned i = 0; i < inst_count; i++) {
+              if(d1_set[i] == 1) in_count1++;
+            }
             for(unsigned i  = 0; i < inst_count; i++) {
               if(d1_set[i] == 1) {
-                StringRef name = cast<CallInst>(label_inst[i])->func_name;
+                StringRef name = dyn_cast<CallInst>(label_inst[i])->func_name;
                 if(name == "CAT_new" && isa<ConstantInt>(label_inst[i]->getOperand(0))) {
                   const_num1.insert(cast<ConstantInt>(label_inst[i]->getOperand(0)));
+                  in_count1--;
                 } else if(name == "CAT_set" && isa<ConstantInt>(label_inst[i]->getOperand(1))) {
                   const_num1.insert(cast<ConstantInt>(label_inst[i]->getOperand(1)));
+                  in_count1--;
                 }
               }
             }
@@ -260,18 +293,23 @@ namespace {
             BitVector in2 = in[cal_inst], d2_set = label_set[inst_label[d2]];
             d2_set &= in2;
             for(unsigned i = 0; i < inst_count; i++) {
+              if(d2_set[i] == 1) in_count2++;
+            }
+            for(unsigned i = 0; i < inst_count; i++) {
               if(d2_set[i] == 1) {
-                StringRef name = cast<CallInst>(label_inst[i])->func_name;
+                StringRef name = dyn_cast<CallInst>(label_inst[i])->func_name;
                 if(name == "CAT_new" && isa<ConstantInt>(label_inst[i]->getOperand(0))) {
                   const_num2.insert(cast<ConstantInt>(label_inst[i]->getOperand(0)));
+                  in_count2--;
                 } else if(name == "CAT_set" && isa<ConstantInt>(label_inst[i]->getOperand(1))) {
                   const_num2.insert(cast<ConstantInt>(label_inst[i]->getOperand(1)));
+                  in_count2--;
                 }
               }
             }
             
           }
-          if(const_num1.size() == 1 && const_num2.size() == 1)  {
+          if(const_num1.size() == 1 && const_num2.size() == 1 && in_count1 == 0 && in_count2 == 0)  {
               Value* result;
               IRBuilder<> builder(cal_inst);
               if(f_name == "CAT_add") {
@@ -285,9 +323,18 @@ namespace {
               });
               dyn_cast<CallInst>(call)->setTailCall();
               cal_inst->eraseFromParent();
+          } else if(v1 == v2 && f_name == "CAT_sub") {
+            Value *result =  ConstantInt::get(IntegerType::get(F.getParent()->getContext(), 64), 0);
+            IRBuilder<> builder(cal_inst);
+            auto call = builder.CreateCall(F.getParent()->getFunction("CAT_set"), {
+                cal_inst->getOperand(0),
+                result
+            });
+            dyn_cast<CallInst>(call)->setTailCall();
+            cal_inst->eraseFromParent();
           }
-        } else if(f_name == "CAT_set" && isa<CallInst>(cal_inst->getOperand(0))) {
-          
+        } else if(f_name == "CAT_new") {
+          BitVector in_set = in[cal_inst], d1_set = label_set[inst_label[cal_inst]];
         }
         genInAndOut(F);
         //printInAndOut(F);
@@ -323,7 +370,7 @@ namespace {
 
     bool runOnFunction (Function &F) override {
       genInAndOut(F);
-      //printInAndOut(F);
+      printInAndOut(F);
       optimizeFunction(F);
       return false;
     }
