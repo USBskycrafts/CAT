@@ -34,6 +34,7 @@ namespace {
     unordered_map<Instruction*, BitVector> gen, kill, in, out;
     queue<Instruction*> q;
     set<StringRef> CAT_Function;
+    unordered_map<CallInst*, int> last_int;
     CAT() : FunctionPass(ID) {}
 
     // This function is invoked once at the initialization phase of the compiler
@@ -68,7 +69,7 @@ namespace {
         if(isa<PHINode>(first_Op)) {
           auto phi = cast<PHINode>(first_Op);
           for(unsigned i = 0; i < phi->getNumOperands(); i++) {
-            if(isa<CallInst>(phi->getOperand(i))) {
+            if(isa<CallInst>(phi->getIncomingValue(i))) {
               label_set[inst_label[cast<CallInst>(phi->getOperand(i))]] |= inst_bitvector[inst];
             }
           }
@@ -100,7 +101,11 @@ namespace {
     void setGenAndKill(Instruction *inst) {
       StringRef fun_name;
       if(isa<CallInst>(inst)) fun_name = cast<CallInst>(inst)->getCalledFunction()->getName();
-      else return;
+      else {
+        gen[inst] = BitVector(inst_count, false);
+        kill[inst] = BitVector(inst_count, false);
+        return;
+      }
       BitVector bit_vec(inst_count, false); 
       if(fun_name == "CAT_new") {
         bit_vec = label_set[inst_label[inst]];
@@ -131,7 +136,7 @@ namespace {
           } 
         }
       }
-
+      //how to solve CAT_new ????????
       if(CAT_Function.count(fun_name)) {
         bit_vec ^= inst_bitvector[inst];
         kill[inst] = bit_vec;
@@ -208,6 +213,7 @@ namespace {
         }
       }
       if(work_list.empty()) return;
+      vector<BasicBlock*> bb_list;
       do {
         auto cal_inst = work_list.front();
         work_list.pop();
@@ -249,7 +255,7 @@ namespace {
                     in_count--;
                     
                   }
-                }
+                } 
               } else if(name == "CAT_set") {
                 if(isa<ConstantInt>(label_inst[i]->getOperand(1))) {
                   auto result = dyn_cast<ConstantInt>(label_inst[i]->getOperand(1));
@@ -266,10 +272,28 @@ namespace {
               cal_inst->replaceAllUsesWith(*result_set.begin());
               cal_inst->eraseFromParent();
           }
+        } else if(f_name == "CAT_get" && isa<PHINode>(cal_inst->getOperand(0))) {
+          unordered_set<ConstantInt*> result_set;
+          auto phi_node = cast<PHINode>(cal_inst->getOperand(0));
+          //errs() << *phi_node;
+          unsigned in_count = 0;
+          for(unsigned i = 0 ; i < phi_node->getNumOperands(); i++) {
+            //errs() << *phi_node->getIncomingValue(i) << "\n";
+            if(isa<ConstantInt>(phi_node->getIncomingValue(i))) {
+              result_set.insert(cast<ConstantInt>(phi_node->getIncomingValue(i)));
+              in_count++;
+            } else if(!isa<Value>(phi_node->getIncomingValue(i))) {
+              in_count++;
+            }
+          }
+          if(result_set.size() == 1 && phi_node->getNumOperands() == in_count) {
+            phi_node->replaceAllUsesWith(*result_set.begin());
+          }
         } else if((f_name == "CAT_add" || f_name == "CAT_sub")) {
           auto v1 = cal_inst->getOperand(1), v2 = cal_inst->getOperand(2);
           unordered_set<ConstantInt*> const_num1, const_num2;
           int in_count1 = 0, in_count2 = 0;
+          CallInst *label_a1, *label_a2;
           if(auto d1 = dyn_cast<CallInst>(v1)) {
             BitVector in1 = in[cal_inst], d1_set = label_set[inst_label[d1]];
             d1_set &= in1;
@@ -285,6 +309,10 @@ namespace {
                 } else if(name == "CAT_set" && isa<ConstantInt>(label_inst[i]->getOperand(1))) {
                   const_num1.insert(cast<ConstantInt>(label_inst[i]->getOperand(1)));
                   in_count1--;
+                } else if (name == "CAT_add") {
+                  if(label_inst[i]->getOperand(1) == label_inst[i]->getOperand(2)) {
+                    label_a1 = cast<CallInst>(label_inst[i]);
+                  }
                 }
               }
             }
@@ -304,6 +332,10 @@ namespace {
                 } else if(name == "CAT_set" && isa<ConstantInt>(label_inst[i]->getOperand(1))) {
                   const_num2.insert(cast<ConstantInt>(label_inst[i]->getOperand(1)));
                   in_count2--;
+                } else if (name == "CAT_add" && label_inst[i]->getParent() == cal_inst->getParent()) {
+                  if(label_inst[i]->getOperand(1) == label_inst[i]->getOperand(2)) {
+                    label_a2 = cast<CallInst>(label_inst[i]);
+                  }
                 }
               }
             }
@@ -332,9 +364,47 @@ namespace {
             });
             dyn_cast<CallInst>(call)->setTailCall();
             cal_inst->eraseFromParent();
-          }
+          } /**else if(label_a1 && label_a2 && cal_inst->getParent() == label_a1->getParent() && cal_inst->getParent() == label_a2->getParent()) {
+            if(label_a1->func_name != "CAT_add" || label_a2->func_name != "CAT_add") break;
+            IRBuilder<> builder(cal_inst);
+            Value* as;
+            IRBuilder<> builder_v1(label_a1);
+            auto call_a1 = builder_v1.CreateCall(F.getParent()->getFunction("CAT_get"), {
+                      label_a1->getOperand(1)
+                    });
+            auto cal_a1 = builder.CreateAdd(call_a1, call_a1);
+            IRBuilder<> builder_v2(label_a2);
+            auto call_a2 = builder_v2.CreateCall(F.getParent()->getFunction("CAT_get"), {
+                      label_a2->getOperand(1)
+                    });
+            auto cal_a2 = builder.CreateAdd(call_a2, call_a2);
+            if(f_name == "CAT_add") as = builder.CreateAdd(cal_a1, cal_a2);
+            else as = builder.CreateSub(cal_a1, cal_a2);
+            auto call = builder.CreateCall(F.getParent()->getFunction("CAT_set"), {
+               cal_inst->getOperand(0),
+               as
+            });
+            dyn_cast<CallInst>(call)->setTailCall();
+            cal_inst->removeFromParent();
+            label_a1->removeFromParent();
+            label_a2->removeFromParent();
+          }**/
         } else if(f_name == "CAT_new") {
-          BitVector in_set = in[cal_inst], d1_set = label_set[inst_label[cal_inst]];
+          
+        }
+        vector<PHINode*> phi_list;
+        for(auto &inst : instructions(F)) {
+          if(isa<PHINode>(inst)) {
+            auto &p = cast<PHINode>(inst);
+            //errs() << p << "\n";
+            if(p.getNumOperands() == 1) {
+              p.replaceAllUsesWith(p.getOperand(0));
+              phi_list.push_back(&p);
+            }
+          }
+        }
+        for(auto &phi : phi_list) {
+          phi->eraseFromParent();
         }
         genInAndOut(F);
         //printInAndOut(F);
@@ -370,8 +440,9 @@ namespace {
 
     bool runOnFunction (Function &F) override {
       genInAndOut(F);
-      printInAndOut(F);
+      //printInAndOut(F);
       optimizeFunction(F);
+      printInAndOut(F);
       return false;
     }
 
