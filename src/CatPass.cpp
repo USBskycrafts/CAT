@@ -101,7 +101,16 @@ namespace {
     void setGenAndKill(Instruction *inst) {
       StringRef fun_name;
       if(isa<CallInst>(inst)) fun_name = cast<CallInst>(inst)->getCalledFunction()->getName();
-      else {
+      else if(auto store_inst = dyn_cast<StoreInst>(inst)) {
+        gen[inst] = inst_bitvector[inst];
+        kill[inst] = BitVector(inst_count, false);
+        if(auto cat_cal = dyn_cast<CallInst>(store_inst->getValueOperand())) {
+          if(CAT_Function.count(cat_cal->func_name)) {
+            kill[inst] = inst_bitvector[cat_cal];
+          }
+        }
+        return;
+      }else {
         gen[inst] = BitVector(inst_count, false);
         kill[inst] = BitVector(inst_count, false);
         return;
