@@ -113,11 +113,11 @@ namespace {
       } else if(CAT_Function.count(fun_name)) {
         auto cat_new = inst->getOperand(0);
         if(auto phi = dyn_cast<PHINode>(cat_new)) {
-          bit_vec |= inst_bitvector[inst];
+          //bit_vec |= inst_bitvector[inst];
           for(unsigned i = 0; i < phi->getNumOperands(); i++) {
             auto cat_new = phi->getOperand(i);
             if(auto call_new = dyn_cast<CallInst>(cat_new)) {
-              //bit_vec |= label_set[inst_label[call_new]];
+              bit_vec |= label_set[inst_label[call_new]];
             } 
           }
         } else if(isa<CallInst>(inst->getOperand(0))) {
@@ -214,6 +214,7 @@ namespace {
       }
       if(work_list.empty()) return;
       vector<BasicBlock*> bb_list;
+      unordered_set<CallInst*>del_list;
       do {
         auto cal_inst = work_list.front();
         work_list.pop();
@@ -282,9 +283,7 @@ namespace {
             if(isa<ConstantInt>(phi_node->getIncomingValue(i))) {
               result_set.insert(cast<ConstantInt>(phi_node->getIncomingValue(i)));
               in_count++;
-            } else if(!isa<Value>(phi_node->getIncomingValue(i))) {
-              in_count++;
-            }
+            } 
           }
           if(result_set.size() == 1 && phi_node->getNumOperands() == in_count) {
             phi_node->replaceAllUsesWith(*result_set.begin());
@@ -293,7 +292,6 @@ namespace {
           auto v1 = cal_inst->getOperand(1), v2 = cal_inst->getOperand(2);
           unordered_set<ConstantInt*> const_num1, const_num2;
           int in_count1 = 0, in_count2 = 0;
-          CallInst *label_a1, *label_a2;
           if(auto d1 = dyn_cast<CallInst>(v1)) {
             BitVector in1 = in[cal_inst], d1_set = label_set[inst_label[d1]];
             d1_set &= in1;
@@ -309,11 +307,7 @@ namespace {
                 } else if(name == "CAT_set" && isa<ConstantInt>(label_inst[i]->getOperand(1))) {
                   const_num1.insert(cast<ConstantInt>(label_inst[i]->getOperand(1)));
                   in_count1--;
-                } else if (name == "CAT_add") {
-                  if(label_inst[i]->getOperand(1) == label_inst[i]->getOperand(2)) {
-                    label_a1 = cast<CallInst>(label_inst[i]);
-                  }
-                }
+                } 
               }
             }
           }
@@ -332,10 +326,6 @@ namespace {
                 } else if(name == "CAT_set" && isa<ConstantInt>(label_inst[i]->getOperand(1))) {
                   const_num2.insert(cast<ConstantInt>(label_inst[i]->getOperand(1)));
                   in_count2--;
-                } else if (name == "CAT_add" && label_inst[i]->getParent() == cal_inst->getParent()) {
-                  if(label_inst[i]->getOperand(1) == label_inst[i]->getOperand(2)) {
-                    label_a2 = cast<CallInst>(label_inst[i]);
-                  }
                 }
               }
             }
@@ -364,51 +354,78 @@ namespace {
             });
             dyn_cast<CallInst>(call)->setTailCall();
             cal_inst->eraseFromParent();
-          } /**else if(label_a1 && label_a2 && cal_inst->getParent() == label_a1->getParent() && cal_inst->getParent() == label_a2->getParent()) {
-            if(label_a1->func_name != "CAT_add" || label_a2->func_name != "CAT_add") break;
-            IRBuilder<> builder(cal_inst);
-            Value* as;
-            IRBuilder<> builder_v1(label_a1);
-            auto call_a1 = builder_v1.CreateCall(F.getParent()->getFunction("CAT_get"), {
-                      label_a1->getOperand(1)
-                    });
-            auto cal_a1 = builder.CreateAdd(call_a1, call_a1);
-            IRBuilder<> builder_v2(label_a2);
-            auto call_a2 = builder_v2.CreateCall(F.getParent()->getFunction("CAT_get"), {
-                      label_a2->getOperand(1)
-                    });
-            auto cal_a2 = builder.CreateAdd(call_a2, call_a2);
-            if(f_name == "CAT_add") as = builder.CreateAdd(cal_a1, cal_a2);
-            else as = builder.CreateSub(cal_a1, cal_a2);
-            auto call = builder.CreateCall(F.getParent()->getFunction("CAT_set"), {
-               cal_inst->getOperand(0),
-               as
-            });
-            dyn_cast<CallInst>(call)->setTailCall();
-            cal_inst->removeFromParent();
-            label_a1->removeFromParent();
-            label_a2->removeFromParent();
-          }**/
-        } else if(f_name == "CAT_new") {
-          
-        }
-        vector<PHINode*> phi_list;
-        for(auto &inst : instructions(F)) {
-          if(isa<PHINode>(inst)) {
-            auto &p = cast<PHINode>(inst);
-            //errs() << p << "\n";
-            if(p.getNumOperands() == 1) {
-              p.replaceAllUsesWith(p.getOperand(0));
-              phi_list.push_back(&p);
-            }
-          }
-        }
-        for(auto &phi : phi_list) {
-          phi->eraseFromParent();
+          } 
         }
         genInAndOut(F);
         //printInAndOut(F);
+        queue<PHINode*> phi_list;
+        for(auto &inst : instructions(F)) {
+          if(auto phi_node = dyn_cast<PHINode>(&inst)) {
+            phi_list.push((phi_node));
+          }
+        }
+        while(!phi_list.empty()) {
+          auto inst = phi_list.front();
+          phi_list.pop();
+          if(auto phi_node = dyn_cast<PHINode>(inst)) {
+            if(phi_node->getNumOperands() == 1 && isa<ConstantInt>(phi_node->getIncomingValue(0))) {
+              phi_node->setOperand(0, cast<ConstantInt>(phi_node->getIncomingValue(0)));
+            } else if(phi_node->getNumOperands() == 1 && isa<CallInst>(phi_node->getIncomingValue(0))) {
+              auto cal = cast<CallInst>(phi_node->getIncomingValue(0));
+              if(cal->func_name == "CAT_new") {
+                //phi_node->replaceAllUsesWith(cal);// to be deleted, iterate all use and modify if in_set has new
+                BitVector phi_bit = BitVector(inst_count, 0);
+                for(unsigned i  = 0; i < phi_node->getNumOperands(); i++) {
+                  if(isa<CallInst>(phi_node->getIncomingValue(i)))
+                    phi_bit |= inst_bitvector[cast<CallInst>(phi_node->getIncomingValue(i))];
+                }
+                for(auto it = phi_node->user_begin(); it != phi_node->user_end(); it++)  {
+                  BitVector in_set = in[dyn_cast<CallInst>(*it)];
+                  in_set &= phi_bit;
+                  if(in_set != BitVector(inst_count, 0)) {
+                    it->replaceUsesOfWith(phi_node, cal);
+                  }
+                  if(isa<PHINode>(*it)) {
+                    it->replaceUsesOfWith(phi_node, cal);
+                  }
+                }
+              } 
+            }
+            
+            unordered_set<ConstantInt*> result_set;
+            unsigned cnt = 0;
+            for(unsigned i = 0; i < phi_node->getNumOperands(); i++) {
+              if(auto cat_cal =dyn_cast<CallInst>(phi_node->getOperand(i))) {
+                if(cat_cal->func_name == "CAT_new" && isa<ConstantInt>(cat_cal->getOperand(0))) {
+                  result_set.insert(cast<ConstantInt>(cat_cal->getOperand(0)));
+                  cnt++;
+                }
+              }
+            } 
+            if(result_set.size() == 1 && cnt == phi_node->getNumOperands()) {
+              for(auto user = phi_node->user_begin(); user != phi_node->user_end(); user++) {
+                auto cat_cal = dyn_cast<CallInst>(*user);
+                if(cat_cal && cat_cal->func_name == "CAT_get") {
+                  BitVector in_bit = in[cat_cal], phi_bit = in[phi_node];
+                  if(in_bit == phi_bit) {
+                    vector<Value*> use_list;
+                    for(auto u : user->users()) {
+                      use_list.push_back(u);
+                      //(*u).setOperand(1, *result_set.begin());
+                      //u.getUser()->replaceUsesOfWith(*user, *result_set.begin());
+                    }
+                    for(auto u : use_list) {
+                      dyn_cast<CallInst>(u)->setOperand(1, *result_set.begin());
+                      del_list.insert(cast<CallInst>(cat_cal));
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       } while(!work_list.empty());
+      for(auto i : del_list) i->eraseFromParent();
     }
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
@@ -443,6 +460,7 @@ namespace {
       //printInAndOut(F);
       optimizeFunction(F);
       printInAndOut(F);
+      ///errs() << F << "\n";
       return false;
     }
 
