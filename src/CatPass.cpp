@@ -14,6 +14,9 @@
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SparseBitVector.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include <climits>
+#include <concepts>
 #include <set>
 #include <unordered_set>
 #include <vector>
@@ -78,11 +81,9 @@ namespace {
             label_set[inst_label[origin_inst]] |= inst_bitvector[inst];
         }
       } else if(fun_name != "CAT_get"){ //arbitrary function
-        //errs() << *inst << "--------1\n";
         unsigned n = inst->getNumOperands();
         for(unsigned i = 0; i < n; i++) {
           auto op = inst->getOperand(i);
-          //errs() << *op << "-------2\n\n\n";
           if(isa<CallInst>(op) && CAT_Function.count(cast<CallInst>(op)->func_name)) {
             auto cat_inst = cast<CallInst>(op);
             if(cat_inst->func_name == "CAT_new") {
@@ -149,8 +150,17 @@ namespace {
       if(CAT_Function.count(fun_name)) {
         bit_vec ^= inst_bitvector[inst];
         kill[inst] = bit_vec;
+      } else if(fun_name == "CAT_get") {
+        kill[inst] = BitVector(inst_count, false);
       } else {
         kill[inst] = BitVector(inst_count, false);
+        for(unsigned i = 0; i < inst_count; i++) {
+          if(auto cat_inst = dyn_cast<CallInst>(inst)) {
+            if(CAT_Function.count(cat_inst->func_name)) {
+              kill[inst] |= inst_bitvector[cat_inst];
+            }
+          }
+        }
       }
     }
 
@@ -227,6 +237,8 @@ namespace {
       do {
         auto cal_inst = work_list.front();
         work_list.pop();
+        genInAndOut(F);
+        aliasOptimize(F);
         StringRef f_name = cal_inst->func_name;
         if(f_name == "CAT_get" && isa<CallInst>(cal_inst->getOperand(0))) {
           auto d1 = cast<CallInst>(cal_inst->getOperand(0));
@@ -234,10 +246,10 @@ namespace {
           d1_set &= in1;
           unordered_set<ConstantInt*> result_set;
           int in_count = 0;
-          for(unsigned i = 0; i < inst_count; i++) {
+          for(unsigned i = 0; i < d1_set.size(); i++) {
             if(d1_set[i] == 1) in_count++;
           }
-          for(unsigned i = 0; i < inst_count; i++) {
+          for(unsigned i = 0; i < d1_set.size(); i++) {
             if(d1_set[i] == 1) {
               StringRef name = dyn_cast<CallInst>(label_inst[i])->func_name;
               if(name == "CAT_new") {
@@ -285,10 +297,8 @@ namespace {
         } else if(f_name == "CAT_get" && isa<PHINode>(cal_inst->getOperand(0))) {
           unordered_set<ConstantInt*> result_set;
           auto phi_node = cast<PHINode>(cal_inst->getOperand(0));
-          //errs() << *phi_node;
           unsigned in_count = 0;
           for(unsigned i = 0 ; i < phi_node->getNumOperands(); i++) {
-            //errs() << *phi_node->getIncomingValue(i) << "\n";
             if(isa<ConstantInt>(phi_node->getIncomingValue(i))) {
               result_set.insert(cast<ConstantInt>(phi_node->getIncomingValue(i)));
               in_count++;
@@ -364,9 +374,21 @@ namespace {
             dyn_cast<CallInst>(call)->setTailCall();
             cal_inst->eraseFromParent();
           } 
+        } else if(f_name == "CAT_set") {
+          Instruction* prev_inst = cal_inst->getPrevNode();
+          if(prev_inst) {
+            while(prev_inst && isa<CallInst>(prev_inst)) {
+              if(CAT_Function.count(cast<CallInst>(prev_inst)->func_name) && prev_inst->getOperand(0) == cal_inst->getOperand(0)) {
+                errs() << *cal_inst << "\n";
+                errs() << *cal_inst->getPrevNode() << "\n";
+                del_list.insert(cast<CallInst>(prev_inst));
+                prev_inst = prev_inst->getPrevNode();
+              } else {
+                break;
+              }
+            }
+          }
         }
-        genInAndOut(F);
-        //printInAndOut(F);
         queue<PHINode*> phi_list;
         for(auto &inst : instructions(F)) {
           if(auto phi_node = dyn_cast<PHINode>(&inst)) {
@@ -439,43 +461,69 @@ namespace {
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     void genInAndOut(Function &F) {
-        label_inst.clear();
-        inst_label.clear();
-        label_set.clear();
-        inst_bitvector.clear();
-        inst_count = 0;
-        in.clear();
-        out.clear();
-        gen.clear();
-        kill.clear();
-        for(auto &inst : instructions(F)) {
-          if(isa<CallInst>(inst)) {
-            CallInst &cal_inst = cast<CallInst>(inst);
-            addLabel(&cal_inst);
-          }
+      label_inst.clear();
+      inst_label.clear();
+      label_set.clear();
+      inst_bitvector.clear();
+      inst_count = 0;
+      in.clear();
+      out.clear();
+      gen.clear();
+      kill.clear();
+      for(auto &inst : instructions(F)) {
+        if(isa<CallInst>(inst)) {
+          CallInst &cal_inst = cast<CallInst>(inst);
+          addLabel(&cal_inst);
         }
-        setBitVector();
-        for(auto &inst : instructions(F)) {
-          if(isa<CallInst>(inst)) {
-            auto &cal_inst = cast<CallInst>(inst);
-            setCluster(&cal_inst);
-          }
-        }
-        setInAndOut(F);
       }
+      setBitVector();
+      for(auto &inst : instructions(F)) {
+        if(isa<CallInst>(inst)) {
+          auto &cal_inst = cast<CallInst>(inst);
+          setCluster(&cal_inst);
+        }
+      }
+      setInAndOut(F);
+    }
+
+    void aliasOptimize(Function &F) {
+      AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>().getAAResults();
+      vector<Instruction*> del_list;
+      for(auto &inst : instructions(F)) {
+        auto cal_inst = dyn_cast<CallInst>(&inst);
+        if(cal_inst && cal_inst->func_name == "CAT_get") {
+          for(auto &[inst_id, bit] : label_set) {
+            auto cat_new = dyn_cast<CallInst>(label_inst[inst_id]);
+            BitVector in_bit = in[cal_inst], cat_bit = inst_bitvector[cat_new];
+            switch(cat_new && aa.alias(cat_new, cal_inst->getOperand(0)) && cat_new->func_name == "CAT_new") {
+              case llvm::AliasResult::MustAlias:
+                in_bit &= cat_bit;
+                if(in_bit != BitVector(inst_count, 0)) {
+                  errs() << *cal_inst << "\n-----" << *cat_new << "\n";
+                  cal_inst->replaceAllUsesWith(cat_new->getOperand(0));
+                  del_list.push_back(cal_inst);
+                }
+                break;
+              default:
+                break;
+            }
+          }
+        }
+      }
+      for(auto &val : del_list) val->eraseFromParent();
+    }
 
     bool runOnFunction (Function &F) override {
       genInAndOut(F);
-      //printInAndOut(F);
       optimizeFunction(F);
-      printInAndOut(F);
-      ///errs() << F << "\n";
+      //printInAndOut(F);
       return false;
     }
 
     // We don't modify the program, so we preserve all analyses.
     // The LLVM IR of functions isn't ready at this point
     void getAnalysisUsage(AnalysisUsage &AU) const override {
+      AU.addRequired<AAResultsWrapperPass>();
       AU.setPreservesAll();
     }
   };
