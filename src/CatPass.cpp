@@ -135,16 +135,8 @@ namespace {
           bit_vec = label_set[inst_label[cal_inst]];
         }
         gen[inst] = inst_bitvector[inst];
-      } else if(fun_name != "CAT_get") {
-        unsigned n = inst->getNumOperands();
-        for(unsigned i = 0; i < n; i++) {
-          auto inst_op = inst->getOperand(i);
-          if(isa<CallInst>(inst_op) && (cast<CallInst>(inst_op)->func_name == "CAT_new")) {
-            gen[inst] = inst_bitvector[inst];
-            //bit_vec = label_set[inst_label[cast<CallInst>(inst_op)]];
-            //kill[inst] = (bit_vec ^= gen[inst]);
-          } 
-        }
+      } else {
+        gen[inst]  = BitVector(inst_count, 0);
       }
       //how to solve CAT_new ????????
       if(CAT_Function.count(fun_name)) {
@@ -154,10 +146,18 @@ namespace {
         kill[inst] = BitVector(inst_count, false);
       } else {
         kill[inst] = BitVector(inst_count, false);
-        for(unsigned i = 0; i < inst_count; i++) {
-          if(auto cat_inst = dyn_cast<CallInst>(inst)) {
-            if(CAT_Function.count(cat_inst->func_name)) {
-              kill[inst] |= inst_bitvector[cat_inst];
+        AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>().getAAResults();
+        for(unsigned i = 0; i < inst->getNumOperands(); i++) {
+          unsigned size = 0;
+          if(auto cat_inst = dyn_cast<CallInst>(inst->getOperand(i))) {
+            if(auto tp = dyn_cast<PointerType>(cat_inst->getType())) {
+              auto elementPointedType = tp->getPointerElementType();
+              if(elementPointedType->isSized()) {
+                size = inst->getModule()->getDataLayout().getTypeStoreSize(elementPointedType);
+              }
+            }
+            if(cat_inst->func_name == "CAT_new" && ModRefInfo::ModRef ==  aa.getModRefInfo(inst, cat_inst, size)) {
+              kill[inst] |= label_set[inst_label[cat_inst]];
             }
           }
         }
@@ -211,13 +211,13 @@ namespace {
         auto in_bit = in[&inst]; 
         errs() << "INSTRUCTION: " << inst << "\n";
         errs() << "***************** IN\n{\n";
-        for(unsigned i = 0; i < in_bit.size(); i++) {
+        for(unsigned i = 0; i < inst_count; i++) {
           if(in_bit[i] == true) errs() << " " << *label_inst[i] << "\n";
         }
         errs() << "}\n**************************************\n";
         errs() << "***************** OUT\n{\n";
         auto out_bit = out[&inst];
-        for(unsigned i = 0; i < out_bit.size(); i++) {
+        for(unsigned i = 0; i < inst_count; i++) {
           if(out_bit[i] == true) errs() << " " << *label_inst[i] << "\n";
         }
         errs() << "}\n**************************************\n\n\n\n";
@@ -379,8 +379,6 @@ namespace {
           if(prev_inst) {
             while(prev_inst && isa<CallInst>(prev_inst)) {
               if(CAT_Function.count(cast<CallInst>(prev_inst)->func_name) && prev_inst->getOperand(0) == cal_inst->getOperand(0)) {
-                errs() << *cal_inst << "\n";
-                errs() << *cal_inst->getPrevNode() << "\n";
                 del_list.insert(cast<CallInst>(prev_inst));
                 prev_inst = prev_inst->getPrevNode();
               } else {
@@ -396,6 +394,7 @@ namespace {
           }
         }
         while(!phi_list.empty()) {
+          genInAndOut(F);
           auto inst = phi_list.front();
           phi_list.pop();
           if(auto phi_node = dyn_cast<PHINode>(inst)) {
@@ -457,6 +456,7 @@ namespace {
         }
       } while(!work_list.empty());
       for(auto i : del_list) i->eraseFromParent();
+      genInAndOut(F);
     }
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
@@ -516,7 +516,7 @@ namespace {
     bool runOnFunction (Function &F) override {
       genInAndOut(F);
       optimizeFunction(F);
-      //printInAndOut(F);
+      printInAndOut(F);
       return false;
     }
 
