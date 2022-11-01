@@ -138,7 +138,6 @@ namespace {
       } else {
         gen[inst]  = BitVector(inst_count, 0);
       }
-      //how to solve CAT_new ????????
       if(CAT_Function.count(fun_name)) {
         bit_vec ^= inst_bitvector[inst];
         kill[inst] = bit_vec;
@@ -156,8 +155,16 @@ namespace {
                 size = inst->getModule()->getDataLayout().getTypeStoreSize(elementPointedType);
               }
             }
-            if(cat_inst->func_name == "CAT_new" && ModRefInfo::ModRef ==  aa.getModRefInfo(inst, cat_inst, size)) {
-              kill[inst] |= label_set[inst_label[cat_inst]];
+            if(cat_inst->func_name == "CAT_new") {
+              switch(aa.getModRefInfo(inst, cat_inst, size)) {
+                case ModRefInfo::ModRef:
+                case ModRefInfo::MustModRef:
+                case ModRefInfo::Mod:
+                  kill[inst] |= label_set[inst_label[cat_inst]];
+                  break;
+                default:
+                  break;
+              }
             }
           }
         }
@@ -296,7 +303,38 @@ namespace {
           }
         } else if(f_name == "CAT_get" && isa<PHINode>(cal_inst->getOperand(0))) {
           unordered_set<ConstantInt*> result_set;
-          auto phi_node = cast<PHINode>(cal_inst->getOperand(0));
+          auto node = cast<PHINode>(cal_inst->getOperand(0));
+          queue<PHINode*> node_list;
+          node_list.push(node);
+          errs() << "--------" << *node << "\n";
+          while(!node_list.empty()) {
+            auto phi_node = node_list.front();
+            node_list.pop();
+            for(auto it = phi_node->op_begin(); it != phi_node->op_end(); it++) {
+              if(isa<PHINode>(*it)) node_list.push(cast<PHINode>(*it));
+              else if(isa<CallInst>(*it)) {
+                auto cat_cal = cast<CallInst>(*it);
+                if(cat_cal->func_name == "CAT_new" && isa<ConstantInt>(cat_cal->getOperand(0))) {
+                  errs() << "the constant" << *cat_cal->getOperand(0) << "\n";
+                  result_set.insert(cast<ConstantInt>(cat_cal->getOperand(0)));
+                }
+              } else if(isa<ConstantInt>(*it)) result_set.insert(cast<ConstantInt>(*it));
+              else goto fail;
+            }
+          }
+          errs() << "Done, no fail!" << "\n";
+          for(auto it = cal_inst->user_begin(); it != cal_inst->user_end(); it++) {
+            BitVector in_bit = in[dyn_cast<CallInst>(*it)];
+            in_bit &= in[node];
+            if(in_bit == in[node] && result_set.size() == 1) {
+              errs() << "replace : " << *cal_inst << '\n';
+              errs() << **it << " " << **result_set.begin() << "\n";
+              it->replaceUsesOfWith(cal_inst, *result_set.begin());
+              del_list.insert(cal_inst);
+            }
+          }
+          //to be modify
+          /***
           unsigned in_count = 0;
           for(unsigned i = 0 ; i < phi_node->getNumOperands(); i++) {
             if(isa<ConstantInt>(phi_node->getIncomingValue(i))) {
@@ -304,9 +342,13 @@ namespace {
               in_count++;
             } 
           }
-          if(result_set.size() == 1 && phi_node->getNumOperands() == in_count) {
+          
+          if(result_set.size() == 1 && node->getNumOperands() == in_count) {
             phi_node->replaceAllUsesWith(*result_set.begin());
           }
+          **/ 
+        fail:
+          ;
         } else if((f_name == "CAT_add" || f_name == "CAT_sub")) {
           auto v1 = cal_inst->getOperand(1), v2 = cal_inst->getOperand(2);
           unordered_set<ConstantInt*> const_num1, const_num2;
@@ -373,7 +415,7 @@ namespace {
             });
             dyn_cast<CallInst>(call)->setTailCall();
             cal_inst->eraseFromParent();
-          } 
+          }
         } else if(f_name == "CAT_set") {
           Instruction* prev_inst = cal_inst->getPrevNode();
           if(prev_inst) {
@@ -516,7 +558,7 @@ namespace {
     bool runOnFunction (Function &F) override {
       genInAndOut(F);
       optimizeFunction(F);
-      printInAndOut(F);
+      //printInAndOut(F);
       return false;
     }
 
