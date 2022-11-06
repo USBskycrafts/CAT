@@ -38,6 +38,7 @@ namespace {
     queue<Instruction*> q;
     set<StringRef> CAT_Function;
     unordered_map<CallInst*, int> last_int;
+    unordered_map<CallInst*, set<Value*>> alias_set;
     CAT() : FunctionPass(ID) {}
 
     // This function is invoked once at the initialization phase of the compiler
@@ -50,7 +51,7 @@ namespace {
       return false;
     }
    
-    void addLabel(CallInst *inst) {
+    void addLabel(Instruction *inst) {
       label_inst[inst_count] = inst;
       inst_label[inst] = inst_count++;
     }
@@ -77,8 +78,10 @@ namespace {
             }
           }
         } else if(isa<CallInst>(first_Op) && cast<CallInst>(first_Op)->func_name == "CAT_new") {
-            auto origin_inst = cast<Instruction>(inst->getArgOperand(0));
+            auto origin_inst = cast<Instruction>(inst->getOperand(0));
             label_set[inst_label[origin_inst]] |= inst_bitvector[inst];
+        } else if(auto some_inst = dyn_cast<Instruction>(first_Op)) {
+          label_set[inst_label[some_inst]] |= inst_bitvector[inst];
         }
       } else if(fun_name != "CAT_get"){ //arbitrary function
         unsigned n = inst->getNumOperands();
@@ -87,11 +90,11 @@ namespace {
           if(isa<CallInst>(op) && CAT_Function.count(cast<CallInst>(op)->func_name)) {
             auto cat_inst = cast<CallInst>(op);
             if(cat_inst->func_name == "CAT_new") {
-              label_set[inst_label[cat_inst]] |= inst_bitvector[inst];
+              label_set[inst_label[inst]] |= inst_bitvector[cat_inst];
             } else if(CAT_Function.count(cat_inst->func_name)) {
               auto cat_new = dyn_cast<CallInst>(cat_inst->getOperand(0));
               if(cat_new && cat_new->func_name == "CAT_new") {
-                label_set[inst_label[cat_new]] |= inst_bitvector[inst];
+                label_set[inst_label[inst]] |= inst_bitvector[cat_new];
               }
             }
           }
@@ -100,33 +103,92 @@ namespace {
     }
 
     void setGenAndKill(Instruction *inst) {
-      StringRef fun_name;
-      if(isa<CallInst>(inst)) fun_name = cast<CallInst>(inst)->getCalledFunction()->getName();
-      else if(auto store_inst = dyn_cast<StoreInst>(inst)) {
-        gen[inst] = BitVector(inst_count, false);
-        kill[inst] = BitVector(inst_count, false);
-        if(auto cat_cal = dyn_cast<CallInst>(store_inst->getValueOperand())) {
-          if(cat_cal->func_name == "CAT_new") {
-            //gen[inst] = inst_bitvector[cat_cal];
-            //kill[inst] = label_set[inst_label[cat_cal]];
-          }
+      gen[inst] = BitVector(inst_count, false);
+      kill[inst] = BitVector(inst_count, false);
+      if(isa<CallInst>(inst)) {
+        auto fun_name = cast<CallInst>(inst)->getCalledFunction()->getName();
+        BitVector bit_vec(inst_count, false); 
+        if(fun_name == "CAT_new") {
+          bit_vec = label_set[inst_label[inst]];
+          gen[inst] = inst_bitvector[inst];
+        } else if(CAT_Function.count(fun_name)) {
+          auto cat_new = inst->getOperand(0);
+          if(auto phi = dyn_cast<PHINode>(cat_new)) {
+            //bit_vec |= inst_bitvector[inst];
+            for(unsigned i = 0; i < phi->getNumOperands(); i++) {
+              auto cat_new = phi->getOperand(i);
+              if(auto call_new = dyn_cast<CallInst>(cat_new)) {
+                bit_vec |= label_set[inst_label[call_new]];
+              } 
+            }
+          } else if(isa<Instruction>(inst->getOperand(0))) {
+            auto *cal_inst = cast<Instruction>(inst->getOperand(0));
+            bit_vec = label_set[inst_label[cal_inst]];
+          } 
+          gen[inst] = inst_bitvector[inst];
+        } else {
+          gen[inst]  = BitVector(inst_count, 0);
         }
-        return;
-      } else if(auto load_inst = dyn_cast<LoadInst>(inst)) {
-        gen[inst] = BitVector(inst_count, false);
-        kill[inst] = BitVector(inst_count, false);
-        if(auto cat_cal = dyn_cast<CallInst>(load_inst->getPointerOperand())) {
-          if(cat_cal->func_name == "CAT_new") {
-            gen[inst] = label_set[inst_label[cat_cal]];
-          } else {
-            AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>().getAAResults();
-            for(auto &instr : instructions(inst->getFunction())) {
-              if(auto cal_cat = dyn_cast<CallInst>(&instr)) {
-                if(cal_cat->func_name == "CAT_new") {
-                  switch(aa.alias(inst, cal_cat)) {
-                    case AliasResult::MustAlias:
-                    case AliasResult::MayAlias:
-                      gen[inst] |= inst_bitvector[cal_cat];
+        if(CAT_Function.count(fun_name)) {
+          auto gen_bit = gen[inst];
+          bit_vec &= gen_bit.flip();
+          kill[inst] = bit_vec;
+        } else if(fun_name == "CAT_get") {
+          kill[inst] = BitVector(inst_count, false);
+        } else {
+          kill[inst] = BitVector(inst_count, false);
+          for(unsigned i = 0; i < inst->getNumOperands(); i++) {
+            if(auto cat_inst = dyn_cast<CallInst>(inst->getOperand(i))) {
+              if(cat_inst->func_name == "CAT_new") {
+                auto cat_fun = dyn_cast<CallInst>(inst)->getCalledFunction();
+                for(auto &sub_inst : instructions(cat_fun)) {
+                  if(auto sub_call = dyn_cast<CallInst>(&sub_inst)) {
+                    if(CAT_Function.count(sub_call->func_name) && sub_call->func_name != "CAT_new") {
+                      if(sub_call->getOperand(0) == cat_fun->getArg(i)) {
+                        kill[inst] |= label_set[inst_label[cat_inst]];
+                      }
+                    }
+                  }
+                }
+              }
+            } else if(isa<PointerType>(inst->getOperand(i)->getType()) && isa<Instruction>(inst->getOperand(i))) {
+              AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>().getAAResults();
+              auto inst_func = cast<CallInst>(inst)->getCalledFunction();
+              bool will_mod = 0;
+              for(auto &inst_fun : instructions(inst_func)) {
+                if(auto cat_call = dyn_cast<CallInst>(&inst_fun)) {
+                  errs() << "CALL: " << *cat_call << "\n";
+                  if(CAT_Function.count(cat_call->func_name) && cat_call->func_name != "CAT_new") {
+                    for(auto it = inst_func->getArg(i)->user_begin(); it != inst->getOperand(i)->user_end(); it++) {
+                      errs() << **it  << "\n";
+                      errs() << (int) aa.alias(cat_call->getOperand(0), *it) << "\n";
+                      switch(aa.alias(cat_call->getOperand(0), *it)) {
+                        case AliasResult::MustAlias:
+                          will_mod = 1;
+                          break;
+                        default:
+                          break;
+                      }
+                      errs() << "will_mod" << will_mod << "\n";
+                    }
+                    
+                  }
+                }
+              }
+              for(auto &inst_c : instructions(inst->getFunction())) {
+                if(isa<StoreInst>(&inst_c)) {
+                  errs() << inst_c << "\n";
+                  errs() << *inst << "\n";
+                  errs() << (int)aa.getModRefInfo(dyn_cast<CallInst>(inst), cast<StoreInst>(&inst_c), 8) << "\n\n\n";
+                  switch(aa.getModRefInfo(dyn_cast<Instruction>(inst), cast<StoreInst>(&inst_c), 8)) {
+                    case ModRefInfo::ModRef:
+                    case ModRefInfo::Mod:
+                    case ModRefInfo::MustMod:
+                    case ModRefInfo::MustModRef:
+                      if(will_mod == 1) {
+                        errs() << cast<StoreInst>(&inst_c)->getValueOperand() << "\n";
+                        kill[inst] |= label_set[inst_label[cast<Instruction>(cast<StoreInst>(&inst_c)->getValueOperand())]];
+                      }
                       break;
                     default:
                       break;
@@ -136,101 +198,26 @@ namespace {
             }
           }
         }
-        return;
+      } 
+      else if(auto store_inst = dyn_cast<StoreInst>(inst)) {
+        gen[inst] = BitVector(inst_count, false);
+        kill[inst] = BitVector(inst_count, false);
+        if(auto cat_cal = dyn_cast<CallInst>(store_inst->getValueOperand())) {
+          if(cat_cal->func_name == "CAT_new") {
+            auto ptr = store_inst->getPointerOperand();
+            for(auto it = ptr->user_begin(); it != ptr->user_end(); it++) {
+              if(auto user_inst = dyn_cast<Instruction>(*it)) {
+                gen[user_inst] |= inst_bitvector[cat_cal];
+              }
+            }
+          }
+        }
+      } else if(auto load_inst = dyn_cast<LoadInst>(inst)) {
+        gen[inst] = BitVector(inst_count, false);
+        kill[inst] = BitVector(inst_count, false);
       }else {
         gen[inst] = BitVector(inst_count, false);
         kill[inst] = BitVector(inst_count, false);
-        return;
-      }
-      BitVector bit_vec(inst_count, false); 
-      if(fun_name == "CAT_new") {
-        bit_vec = label_set[inst_label[inst]];
-        gen[inst] = inst_bitvector[inst];
-      } else if(CAT_Function.count(fun_name)) {
-        auto cat_new = inst->getOperand(0);
-        if(auto phi = dyn_cast<PHINode>(cat_new)) {
-          //bit_vec |= inst_bitvector[inst];
-          for(unsigned i = 0; i < phi->getNumOperands(); i++) {
-            auto cat_new = phi->getOperand(i);
-            if(auto call_new = dyn_cast<CallInst>(cat_new)) {
-              bit_vec |= label_set[inst_label[call_new]];
-            } 
-          }
-        } else if(isa<CallInst>(inst->getOperand(0))) {
-          CallInst *cal_inst = cast<CallInst>(inst->getOperand(0));
-          bit_vec = label_set[inst_label[cal_inst]];
-        }
-        gen[inst] = inst_bitvector[inst];
-      } else {
-        gen[inst]  = BitVector(inst_count, 0);
-      }
-      if(CAT_Function.count(fun_name)) {
-        bit_vec ^= inst_bitvector[inst];
-        kill[inst] = bit_vec;
-      } else if(fun_name == "CAT_get") {
-        kill[inst] = BitVector(inst_count, false);
-      } else {
-        kill[inst] = BitVector(inst_count, false);
-        for(unsigned i = 0; i < inst->getNumOperands(); i++) {
-          if(auto cat_inst = dyn_cast<CallInst>(inst->getOperand(i))) {
-            if(cat_inst->func_name == "CAT_new") {
-              auto cat_fun = dyn_cast<CallInst>(inst)->getCalledFunction();
-              for(auto &sub_inst : instructions(cat_fun)) {
-                if(auto sub_call = dyn_cast<CallInst>(&sub_inst)) {
-                  if(CAT_Function.count(sub_call->func_name) && sub_call->func_name != "CAT_new") {
-                    if(sub_call->getOperand(0) == cat_fun->getArg(i)) {
-                      kill[inst] |= label_set[inst_label[cat_inst]];
-                    }
-                  }
-                }
-              }
-            }
-          } else if(isa<PointerType>(inst->getOperand(i)->getType()) && isa<Instruction>(inst->getOperand(i))) {
-            AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>().getAAResults();
-            auto inst_func = cast<CallInst>(inst)->getCalledFunction();
-            bool will_mod = 0;
-            for(auto &inst_fun : instructions(inst_func)) {
-              if(auto cat_call = dyn_cast<CallInst>(&inst_fun)) {
-                errs() << "CALL: " << *cat_call << "\n";
-                if(CAT_Function.count(cat_call->func_name) && cat_call->func_name != "CAT_new") {
-                  for(auto it = inst_func->getArg(i)->user_begin(); it != inst->getOperand(i)->user_end(); it++) {
-                    errs() << **it  << "\n";
-                    errs() << (int) aa.alias(cat_call->getOperand(0), *it) << "\n";
-                    switch(aa.alias(cat_call->getOperand(0), *it)) {
-                      case AliasResult::MustAlias:
-                        will_mod = 1;
-                        break;
-                      default:
-                        break;
-                    }
-                    errs() << "will_mod" << will_mod << "\n";
-                  }
-                  
-                }
-              }
-            }
-            for(auto &inst_c : instructions(inst->getFunction())) {
-              if(isa<StoreInst>(&inst_c)) {
-                errs() << inst_c << "\n";
-                errs() << *inst << "\n";
-                errs() << (int)aa.getModRefInfo(dyn_cast<CallInst>(inst), cast<StoreInst>(&inst_c), 8) << "\n\n\n";
-                switch(aa.getModRefInfo(dyn_cast<Instruction>(inst), cast<StoreInst>(&inst_c), 8)) {
-                  case ModRefInfo::ModRef:
-                  case ModRefInfo::Mod:
-                  case ModRefInfo::MustMod:
-                  case ModRefInfo::MustModRef:
-                    if(will_mod == 1) {
-                      errs() << cast<StoreInst>(&inst_c)->getValueOperand() << "\n";
-                      kill[inst] |= label_set[inst_label[cast<Instruction>(cast<StoreInst>(&inst_c)->getValueOperand())]];
-                    }
-                    break;
-                  default:
-                    break;
-                }
-              }
-            }
-          }
-        }
       }
     }
 
@@ -309,8 +296,18 @@ namespace {
         work_list.pop();
         genInAndOut(F);
         aliasOptimize(F);
+        setAliasSet(F);
         StringRef f_name = cal_inst->func_name;
+        int will_leave = 0;
         if(f_name == "CAT_get" && isa<CallInst>(cal_inst->getOperand(0))) {
+          auto cat_call = cast<CallInst>(cal_inst->getOperand(0));
+          if(cat_call->func_name != "CAT_new") continue;
+          for(unsigned i = 0; i < in[cal_inst].size(); i++) {
+            if(in[cal_inst][i] == 1 && alias_set[cat_call].count(label_inst[i])) {
+              will_leave++;
+            }
+          }
+          if(will_leave >= 2) continue;
           auto d1 = cast<CallInst>(cal_inst->getOperand(0));
           BitVector in1 = in[cal_inst], d1_set = label_set[inst_label[d1]];
           d1_set &= in1;
@@ -369,7 +366,6 @@ namespace {
           auto node = cast<PHINode>(cal_inst->getOperand(0));
           queue<PHINode*> node_list;
           node_list.push(node);
-          errs() << "--------" << *node << "\n";
           while(!node_list.empty()) {
             auto phi_node = node_list.front();
             node_list.pop();
@@ -479,7 +475,7 @@ namespace {
             dyn_cast<CallInst>(call)->setTailCall();
             cal_inst->eraseFromParent();
           }
-        } /**else if(f_name == "CAT_set") {
+        } else if(f_name == "CAT_set") {
           Instruction* prev_inst = cal_inst->getPrevNode();
           if(prev_inst) {
             while(prev_inst && isa<CallInst>(prev_inst)) {
@@ -491,7 +487,7 @@ namespace {
               }
             }
           }
-        }**/
+        }
         queue<PHINode*> phi_list;
         for(auto &inst : instructions(F)) {
           if(auto phi_node = dyn_cast<PHINode>(&inst)) {
@@ -576,11 +572,8 @@ namespace {
       gen.clear();
       kill.clear();
       for(auto &inst : instructions(F)) {
-        if(isa<CallInst>(inst)) {
-          CallInst &cal_inst = cast<CallInst>(inst);
-          addLabel(&cal_inst);
+          addLabel(&inst);
         }
-      }
       setBitVector();
       for(auto &inst : instructions(F)) {
         if(isa<CallInst>(inst)) {
@@ -617,9 +610,29 @@ namespace {
       }
       for(auto &val : del_list) val->eraseFromParent();
     }
+    
+    void setAliasSet(Function &F) {
+      alias_set.clear();
+      for(auto &inst : instructions(F)) {
+        if(auto cal_inst = dyn_cast<CallInst>(&inst)) {
+          if(cal_inst->func_name == "CAT_new") {
+            for(auto it = cal_inst->user_begin(); it != cal_inst->user_end(); it++) {
+              alias_set[cal_inst].insert(*it);
+              if(auto storeInst = dyn_cast<StoreInst>(*it)) {
+                auto ptr = storeInst->getPointerOperand();
+                for(auto ptr_user = ptr->user_begin(); ptr_user != ptr->user_end(); ptr_user++) {
+                  alias_set[cal_inst].insert(*ptr_user);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
 
     bool runOnFunction (Function &F) override {
       genInAndOut(F);
+      setAliasSet(F);
       optimizeFunction(F);
       printInAndOut(F);
       return false;
