@@ -39,6 +39,8 @@ namespace {
     set<StringRef> CAT_Function;
     unordered_map<CallInst*, int> last_int;
     unordered_map<CallInst*, set<Value*>> alias_set;
+    unordered_map<Instruction*, Value*> must_alias;
+    unordered_map<Instruction*, set<Value*>> may_alias;
     CAT() : FunctionPass(ID) {}
 
     // This function is invoked once at the initialization phase of the compiler
@@ -363,6 +365,7 @@ namespace {
           }
         } else if(f_name == "CAT_get" && isa<PHINode>(cal_inst->getOperand(0))) {
           unordered_set<ConstantInt*> result_set;
+          auto prev_inst = cal_inst->getPrevNode();
           auto node = cast<PHINode>(cal_inst->getOperand(0));
           queue<PHINode*> node_list;
           node_list.push(node);
@@ -374,38 +377,40 @@ namespace {
               else if(isa<CallInst>(*it)) {
                 auto cat_cal = cast<CallInst>(*it);
                 if(cat_cal->func_name == "CAT_new" && isa<ConstantInt>(cat_cal->getOperand(0))) {
-                  errs() << "the constant" << *cat_cal->getOperand(0) << "\n";
                   result_set.insert(cast<ConstantInt>(cat_cal->getOperand(0)));
                 }
               } else if(isa<ConstantInt>(*it)) result_set.insert(cast<ConstantInt>(*it));
               else goto fail;
             }
           }
-          errs() << "Done, no fail!" << "\n";
           for(auto it = cal_inst->user_begin(); it != cal_inst->user_end(); it++) {
             BitVector in_bit = in[dyn_cast<CallInst>(*it)];
             in_bit &= in[node];
             if(in_bit == in[node] && result_set.size() == 1) {
-              errs() << "replace : " << *cal_inst << '\n';
-              errs() << **it << " " << **result_set.begin() << "\n";
               it->replaceUsesOfWith(cal_inst, *result_set.begin());
               del_list.insert(cal_inst);
             }
           }
-          //to be modify
-          /***
-          unsigned in_count = 0;
-          for(unsigned i = 0 ; i < phi_node->getNumOperands(); i++) {
-            if(isa<ConstantInt>(phi_node->getIncomingValue(i))) {
-              result_set.insert(cast<ConstantInt>(phi_node->getIncomingValue(i)));
-              in_count++;
-            } 
+          while(prev_inst && prev_inst != &cal_inst->getParent()->front()) {
+            if(isa<CallInst>(prev_inst) && CAT_Function.count(cast<CallInst>(prev_inst)->func_name)) break;
+            prev_inst = prev_inst->getPrevNode();
           }
-          
-          if(result_set.size() == 1 && node->getNumOperands() == in_count) {
-            phi_node->replaceAllUsesWith(*result_set.begin());
+          if(prev_inst && isa<CallInst>(prev_inst) && (cast<CallInst>(prev_inst)->func_name == "CAT_new")) {
+            for(auto get_user : cal_inst->users()) {
+              if(in[dyn_cast<Instruction>(get_user)] == in[cal_inst]) {
+                get_user->replaceUsesOfWith(cal_inst, prev_inst->getOperand(0));
+                del_list.insert(cal_inst);
+              }
+            }
+          } else if(prev_inst && isa<CallInst>(prev_inst) && (cast<CallInst>(prev_inst)->func_name == "CAT_set")) {
+            for(auto get_user : cal_inst->users()) {
+              if(in[dyn_cast<Instruction>(get_user)] == in[cal_inst]) {
+                errs() << *cal_inst << '\n';
+                get_user->replaceUsesOfWith(cal_inst, prev_inst->getOperand(1));
+                del_list.insert(cal_inst);
+              }
+            }
           }
-          **/ 
         fail:
           ;
         } else if((f_name == "CAT_add" || f_name == "CAT_sub")) {
@@ -477,8 +482,10 @@ namespace {
           }
         } else if(f_name == "CAT_set") {
           Instruction* prev_inst = cal_inst->getPrevNode();
+          int count = 0;
+          static const int layer = 1;
           if(prev_inst) {
-            while(prev_inst && isa<CallInst>(prev_inst)) {
+            while(prev_inst && isa<CallInst>(prev_inst) && count++ <= layer) {
               if(CAT_Function.count(cast<CallInst>(prev_inst)->func_name) && prev_inst->getOperand(0) == cal_inst->getOperand(0)) {
                 del_list.insert(cast<CallInst>(prev_inst));
                 prev_inst = prev_inst->getPrevNode();
@@ -630,11 +637,87 @@ namespace {
       }
     }
 
+
+    void aliasLoadInst(CallInst* v1, LoadInst* load_inst) {
+      vector<StoreInst*> store_list;
+      AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>().getAAResults();
+      for(auto &inst : instructions(v1->getFunction())) {
+        if(isa<StoreInst>(inst)) store_list.push_back(cast<StoreInst>(&inst));
+      }
+      for(auto store_inst : store_list) {
+        switch(aa.alias(MemoryLocation::get(load_inst), MemoryLocation::get(store_inst))) {
+          case AliasResult::MustAlias:
+            must_alias[v1] = load_inst;
+            break;
+          case AliasResult::MayAlias:
+            may_alias[v1].insert(load_inst);
+            break;
+          default:
+            break;
+        }
+      }
+    }
+
+    void aliasNormalInst(CallInst* v1, Instruction* inst) {
+      for(auto &mem_op : cast<Instruction>(inst)->operands()) {
+        if(mem_op.getUser() == v1) may_alias[cast<CallInst>(v1)].insert(mem_op.getUser());
+      }
+    }
+
+    void catAlias(Function &F) {
+      vector<CallInst*> cat_inst;
+      for(auto &inst : instructions(F)) {
+        if(isa<CallInst>(&inst) && CAT_Function.count(cast<CallInst>(inst).func_name)) {
+          cat_inst.push_back(cast<CallInst>(&inst));
+        }
+      }
+      for(auto inst1 : cat_inst) {
+        for(auto inst2 : cat_inst) {
+          auto v1 = inst1->getOperand(0), v2 = inst2->getOperand(0);
+          if(isa<CallInst>(v1) && cast<CallInst>(v1)->func_name == "CAT_new") {
+            if(v1 == v2) must_alias[cast<CallInst>(v1)] = v2;
+            else if(isa<PHINode>(v2)) {
+              queue<PHINode*> phi_list;
+              if(cast<PHINode>(v2)->getNumIncomingValues() == 1) {
+                auto val = cast<PHINode>(v2)->getIncomingValue(0);
+                if(v1 == val) must_alias[cast<CallInst>(v1)] = val;
+                continue;
+              }
+              while(!phi_list.empty()) {
+                auto phi_node = phi_list.front();
+                phi_list.pop();
+                for(auto &phi_op : phi_node->operands()) {
+                  auto mem_value = phi_op.getUser();
+                  if(mem_value == v1) may_alias[cast<CallInst>(v1)].insert(mem_value);
+                  else if(isa<PHINode>(mem_value)) phi_list.push(cast<PHINode>(mem_value));
+                  else if(isa<LoadInst>(mem_value)) {
+                    auto load_inst = cast<LoadInst>(mem_value);
+                    aliasLoadInst(cast<CallInst>(v1), load_inst);
+                  }
+                  else if(isa<Instruction>(mem_value)) {
+                    aliasNormalInst(cast<CallInst>(v1), cast<Instruction>(mem_value));
+                  }
+                }
+              }
+            } 
+            else if(isa<LoadInst>(v2)) {
+              auto load_inst = cast<LoadInst>(v2);
+              aliasLoadInst(cast<CallInst>(v1), load_inst);
+            } 
+            else if(isa<Instruction>(v2)) {
+              aliasNormalInst(cast<CallInst>(v1), cast<Instruction>(v2));
+            } 
+          }
+        }
+      }
+    }
+
     bool runOnFunction (Function &F) override {
       genInAndOut(F);
       setAliasSet(F);
+      catAlias(F);
       optimizeFunction(F);
-      printInAndOut(F);
+      //printInAndOut(F);
       return false;
     }
 
