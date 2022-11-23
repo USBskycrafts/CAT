@@ -436,23 +436,25 @@ namespace {
 
     void CAT_SETPropagation(CallInst *callInst) {
       auto operand0 = callInst->getOperand(0);
-      std::set<Value*> users;
-      for(auto user : operand0->users()) users.insert(user);
-      auto prev = callInst->getPrevNode();
-      while(prev) {
-        switch (catType[prev]) {
-          case CAT_SET:
-          case CAT_SUB:
+      auto next = callInst->getNextNode();
+      if(next->getNumOperands() >= 1 && next->getOperand(0) == operand0) {
+        switch(catType[next]) {
           case CAT_ADD:
+          case CAT_SUB:
           {
-            auto operand0_prev = cast<CallInst>(prev)->getOperand(0);
-            if(operand0_prev == operand0) delList.push(prev);
+            if(operand0 == next->getOperand(0) && next->getOperand(1) != operand0 && next->getOperand(2) != operand0) {
+              delList.push(callInst);
+            }
             break;
           }
+          case CAT_SET:
+            if(operand0 == next->getOperand(0)) {
+              delList.push(callInst);
+            }
+            break;
           default:
-            return;
+            break;
         }
-        prev = prev->getPrevNode();
       }
     }
 
@@ -566,12 +568,12 @@ namespace {
       }
 
       if(constants.size() == 1) {
-        IRBuilder<> builder(callInst);
+        IRBuilder<> builder(callInst->getNextNode());
         auto call = builder.CreateCall(callInst->getModule()->getFunction("CAT_set"), {
           callInst->getOperand(0),
           ConstantInt::get(IntegerType::get(callInst->getModule()->getContext(), 64), *constants.begin()),
         });
-        call->setTailCall();
+        catType[call] = CAT_SET;
         delList.push(callInst);
       }
     }
@@ -596,6 +598,10 @@ namespace {
             }
             break;
           }
+          case CAT_ADD:
+          case CAT_SUB:
+            if(inst->getOperand(0) == operand0) return;
+            break;
           default:
             break;
         }
