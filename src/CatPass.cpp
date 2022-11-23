@@ -303,7 +303,6 @@ struct CAT : public ModulePass {
       auto inst = q.front();
       q.pop();
       aliasOptimization(F);
-      // errs()<<"do propagation for ins "<<*inst<<"\n";
       auto funcName = inst->getCalledFunction()->getName();
       ConstantInt *value = nullptr;
       // bool isDelete=false;
@@ -345,7 +344,6 @@ struct CAT : public ModulePass {
     for (uint i = 0; i < instBit.size(); ++i) {
       ConstantInt *value = nullptr;
       if (instBit[i]) {
-        errs() << *labelValue[i] << "\n";
         ++varCnt;
         auto var = dyn_cast<CallInst>(labelValue[i]);
         if (var == nullptr)
@@ -430,12 +428,8 @@ struct CAT : public ModulePass {
     if (funcName == "CAT_get") {
       auto op = inst->getOperand(0);
       if (auto var = dyn_cast<CallInst>(op)) {
-        errs() << *var << "\n";
         auto instBit = IN[inst];
-        printBit(instBit);
         instBit &= mustAlias[valueLabel[var]];
-        printBit(mustAlias[valueLabel[var]]);
-        printBit(instBit);
         res = uniqueNess(instBit);
       } else if (auto var = dyn_cast<PHINode>(op)) {
         res = phiOperand(var, inst);
@@ -510,7 +504,6 @@ struct CAT : public ModulePass {
   }
   BitVector getModify(CallInst *inst) {
     BitVector ans(totalCnt, false);
-    errs() << "finding modify ptr for ins " << *inst << "\n";
     AliasAnalysis &aa =
         getAnalysis<AAResultsWrapperPass>(*inst->getFunction()).getAAResults();
     for (uint i = 0; i < inst->getNumOperands(); ++i) {
@@ -529,7 +522,6 @@ struct CAT : public ModulePass {
           case ModRefInfo::MustModRef:
           case ModRefInfo::Mod:
             ans |= mustAlias[valueLabel[op]];
-            errs() << "it modified " << op << "\n";
             break;
           default:
             break;
@@ -542,26 +534,26 @@ struct CAT : public ModulePass {
   }
 
   bool isRecursive(CallInst *callInst) {
-    errs() << "CHECK " << *callInst << "if it is recursive\n";
+    // errs() << "CHECK " << *callInst << "if it is recursive\n";
     for(auto &inst : instructions(callInst->getCalledFunction())) {
       if(!isa<CallInst>(inst)) continue;
       auto calledCallInst = cast<CallInst>(&inst);
       if(calledCallInst->getCalledFunction()->getName() == callInst->getCalledFunction()->getName()) {
-        errs() << *callInst << " is a recursive function.\n";
+        // errs() << *callInst << " is a recursive function.\n";
         return true;
       } 
     }
-    errs() << *callInst << " is not a recursive function.\n";
+    // errs() << *callInst << " is not a recursive function.\n";
     return false;
   }
 
   bool isInlinable(CallInst *callInst) {
-    errs() << "CHECK " << *callInst << " if it is inlinable\n";
+    // errs() << "CHECK " << *callInst << " if it is inlinable\n";
     auto funName = callInst->getCalledFunction()->getName();
     if(catFunctionName.count(funName) || funName == "CAT_get") return false;
     if(!hasCATOperand(callInst)) return false;
     if(isRecursive(callInst)) return false;
-    errs() << *callInst << " is able to inline\n";
+    // errs() << *callInst << " is able to inline\n";
     return true;
   }
 
@@ -570,7 +562,7 @@ struct CAT : public ModulePass {
       if(auto catInst = dyn_cast<CallInst>(operand)) {
         auto funName = catInst->getCalledFunction()->getName();
         if(catFunctionName.count(funName)) {
-          errs() << *callInst << " has CAT instruction\n";
+          // errs() << *callInst << " has CAT instruction\n";
           return true;
         }
       }
@@ -585,7 +577,7 @@ struct CAT : public ModulePass {
         if (auto callInst = dyn_cast<CallInst>(&inst)) {
           if (isInlinable(callInst)) {
             inlineList.insert(callInst);
-            errs() << *callInst << " is inlined\n";
+            // errs() << *callInst << " is inlined\n";
           }
         }
       }
