@@ -41,15 +41,16 @@ namespace {
     PHI,
     STORE,
     LOAD,
-    OTHER_ESC
+    OTHER_ESC,
+    ARG
   };
 
   struct CAT : public FunctionPass {
     static char ID; 
     std::unordered_map<Value*, CAT_Type> catType;
-    std::unordered_map<Value*, std::set<CallInst*>> defSets;
-    std::unordered_map<Instruction*, std::set<CallInst*>> gens, kills;
-    std::unordered_map<Instruction*, std::set<CallInst*>> ins, outs;
+    std::unordered_map<Value*, std::set<Value*>> defSets;
+    std::unordered_map<Value*, std::set<Value*>> gens, kills;
+    std::unordered_map<Instruction*, std::set<Value*>> ins, outs;
     std::queue<Instruction*> delList;
     std::unordered_map<Instruction*, std::set<CallInst*>> mayAlias, mustAlias;
     CAT() : FunctionPass(ID) {}
@@ -76,10 +77,15 @@ namespace {
         } else if(funName == "CAT_get") {
           catType[callInst] = CAT_GET;
         } else {
-          for(auto &operand : callInst->operands()) {
-            if(catType[operand] == CAT_NEW) {
-              catType[callInst] = OTHER_ESC;
-              return;
+          for(Value *operand : callInst->operands()) {
+            switch(catType[operand]) {
+              case CAT_NEW:
+              case ARG:
+              case LOAD:
+                catType[callInst] = OTHER_ESC;
+                return;
+              default:
+                break;
             }
           }
           catType[callInst] = NONE;
@@ -93,31 +99,111 @@ namespace {
       }
     }
 
-    void setDefSet(CallInst* callInst) {
-      auto operand0 = callInst->getOperand(0);
-      switch(catType[callInst]) {
+    std::set<Value*> searchPHI(PHINode* phi) {
+      std::set<Value*> phiSet;
+      std::queue<PHINode*> phiList;
+      phiList.push(phi);
+
+      std::mutex lock;
+      std::vector<std::thread*> threads;
+
+      while(!phiList.empty()) {
+        auto phi_node = phiList.front();
+        phiList.pop();
+        for(Value *operand : phi_node->operands()) {
+          std::function task = [&](Value *operand) {
+            std::unique_lock<std::mutex> l(lock);
+            if(isa<PHINode>(operand)) phiList.push(cast<PHINode>(operand));
+            l.unlock();
+            switch(catType[operand]) {
+              case CAT_NEW:
+              case LOAD:
+              case ARG:
+              {
+                l.lock();
+                phiSet.insert(operand);
+                l.unlock();
+                break;
+              }
+              default:
+                break;
+            }
+          };
+          std::thread *t = new std::thread(task, operand);
+          threads.push_back(t);
+        }
+      }
+      for(auto t : threads) {
+        t->join();
+        delete t;
+      }
+      return phiSet;
+    }
+
+    void setDefSet(Instruction* inst) {
+      switch(catType[inst]) {
         case CAT_NEW:
-          defSets[callInst].insert(callInst);
+          defSets[inst].insert(inst);
           break; 
         case CAT_ADD:
         case CAT_SET:
         case CAT_SUB:
-          defSets[operand0].insert(callInst);
+        {
+          auto operand0 = inst->getOperand(0);
+          defSets[operand0].insert(inst);
+          defSets[operand0].insert(operand0);
           break;
+        }
+        case CAT_GET:
+        {
+          auto operand0 = inst->getOperand(0);
+          defSets[operand0].insert(operand0);
+          break;
+        }
+        case STORE:
+        {
+          auto storeInst = cast<StoreInst>(inst);
+          auto val = storeInst->getValueOperand();
+          auto defSet = defSets[val];
+          auto store_defSet = defSets[inst];
+          set_union(defSet.begin(), defSet.end(), store_defSet.begin(), store_defSet.end(), inserter(store_defSet, store_defSet.begin()));
+          defSets[inst] = store_defSet;
+          break;
+        }
         default:
           break;
       }
     }
 
+    void setPHIDefSet(PHINode* inst) {
+      std::set<Value*> old_set;
+      auto set = searchPHI(cast<PHINode>(inst));
+      for(auto val : set) {
+        auto val_set = defSets[val];
+        set_union(old_set.begin(), old_set.end(), val_set.begin(), val_set.end(), inserter(old_set, old_set.begin()));
+      }
+      auto phi_set = defSets[inst];
+      set_union(old_set.begin(), old_set.end(), phi_set.begin(), phi_set.end(), inserter(phi_set, phi_set.begin()));
+      defSets[inst] = phi_set;
+      for(auto val : set) {
+        auto val_set = defSets[val];
+        set_union(phi_set.begin(), phi_set.end(), val_set.begin(), val_set.end(), inserter(val_set, val_set.begin()));
+        defSets[val] = val_set;
+      }
+    }
+
     void setDefSets(Function &F) {
       for(auto &inst : instructions(F)) {
-        if(auto callInst = dyn_cast<CallInst>(&inst)) {
-          setDefSet(callInst);
+        setDefSet(&inst);
+      }
+      for(auto &inst : instructions(F)) {
+        if(auto phi = dyn_cast<PHINode>(&inst)) {
+          setPHIDefSet(phi);
         }
       }
     }
 
-    void printGenAndKill(Instruction* inst) {
+    void printGenAndKill(Value* inst) {
       #ifdef DEBUG
       errs() << "INSTRUCTION: " << *inst << "\n";
       errs() << "***************** GEN\n{\n";
@@ -182,7 +268,6 @@ namespace {
 
     bool getModRef(CallInst *callInst, unsigned index) {
       auto arg = callInst->getCalledFunction()->getArg(index);
-      errs() << *arg << "\n";
       for(auto &inst : instructions(*callInst->getCalledFunction())) {
         if(auto *callInst_inner = dyn_cast<CallInst>(&inst)) {
           switch(catType[callInst_inner]) {
@@ -215,8 +300,7 @@ namespace {
 
     std::mutex genLock;
     void setGenAndKill(Instruction* inst) {
-      auto operand0 = inst->getOperand(0);
-      std::set<CallInst*> defSet;
+      std::set<Value*> defSet;
       switch (catType[inst]) {
         case CAT_NEW:
           defSet = defSets[inst];
@@ -225,6 +309,7 @@ namespace {
         case CAT_SUB:
         case CAT_SET:
         {
+          auto operand0 = inst->getOperand(0);
           defSet = defSets[operand0];
           if(catType[operand0] == LOAD) {
             auto loadInst = cast<LoadInst>(operand0);
@@ -235,10 +320,15 @@ namespace {
           }
           break;
         }
+        case STORE:
+        case PHI:
+        {
+          defSet = defSets[inst];
+          break;
+        }
         case OTHER_ESC:
         {
           unsigned index_num = cast<CallInst>(inst)->getNumOperands();
-          errs() << index_num << "\n";
           for(unsigned i = 0; i < index_num - 1; i++) {
             auto willMode = getModRef(cast<CallInst>(inst), i);
             if(willMode == 1) {
@@ -265,7 +355,9 @@ namespace {
           gen.insert(cast<CallInst>(inst));
           set_difference(defSet.begin(), defSet.end(), gen.begin(), gen.end(), inserter(kill, kill.begin()));
           break;
+        case STORE:
         case OTHER_ESC:
+        case PHI:
         {
           kill = defSet;
           break;
@@ -276,11 +368,16 @@ namespace {
     }
 
     void setGensAndKills(Function &F) {
+      std::queue<std::thread*> thread_list;
       for(auto &inst : instructions(F)) {
-        if(auto callInst = dyn_cast<CallInst>(&inst)) {
-          std::thread task(&CAT::setGenAndKill, this, callInst);
-          task.join();
-        }
+        std::thread *task = new std::thread(&CAT::setGenAndKill, this, &inst);
+        thread_list.push(task);
+      }
+      while(!thread_list.empty()) {
+        auto task = thread_list.front();
+        task->join();
+        delete(task);
+        thread_list.pop();
       }
     }
 
@@ -297,10 +394,27 @@ namespace {
         auto &headInst = BB->front();
         auto tailInst = BB->getTerminator();
         auto out_old = outs[tailInst], gen = gens[&headInst], kill = kills[&headInst];
-        std::set<CallInst*> in = {}, out = {};
+        std::set<Value*> in = {}, out = {};
         for(auto prev_BB : predecessors(BB)) {
           auto prev_out = outs[prev_BB->getTerminator()];
           set_union(prev_out.begin(), prev_out.end(), in.begin(), in.end(), inserter(in, in.begin()));
+        }
+        if(BB == &F.front()) {
+          for(auto &arg : F.args()) {
+            for(auto user : arg.users()) {
+              switch (catType[user]) {
+                case CAT_GET:
+                case CAT_ADD:
+                case CAT_SUB:
+                case CAT_SET:
+                  in.insert(&arg);
+                  catType[&arg] = ARG;
+                  break;
+                default:
+                  break;
+              }
+            }
+          }
         }
         set_difference(in.begin(), in.end(), kill.begin(), kill.end(), inserter(out, out.begin()));
         set_union(out.begin(), out.end(), gen.begin(), gen.end(), inserter(out, out.begin()));
@@ -443,13 +557,17 @@ namespace {
           case CAT_SUB:
           {
             if(operand0 == next->getOperand(0) && next->getOperand(1) != operand0 && next->getOperand(2) != operand0) {
+              std::unique_lock<std::mutex> l(deleteLock);
               delList.push(callInst);
+              l.unlock();
             }
             break;
           }
           case CAT_SET:
             if(operand0 == next->getOperand(0)) {
+              std::unique_lock<std::mutex> l(deleteLock);
               delList.push(callInst);
+              l.unlock();
             }
             break;
           default:
@@ -463,35 +581,55 @@ namespace {
       auto in = ins[callInst];
       std::set<int64_t> constants1, constants2;
       std::set<Instruction*> inst1_set, inst2_set;
+      std::unique_lock<std::mutex> l(deleteLock);
+      l.unlock();
+
+      if(catType[callInst] == CAT_SUB && operand1 == operand2) {
+        l.lock();
+        IRBuilder<> builder(callInst);
+        auto call = builder.CreateCall(callInst->getModule()->getFunction("CAT_set"), {
+          callInst->getOperand(0),
+          ConstantInt::get(IntegerType::get(callInst->getModule()->getContext(), 64), 0),
+        });
+        catType[call] = CAT_SET;
+        delList.push(callInst);
+        l.unlock();
+        return;
+      }
+
+
       for(auto inst : in) {
         switch(catType[inst]) {
+          case PHI:
           case CAT_NEW:
+          case LOAD:
           {
             if(inst == operand1) {
-              inst1_set.insert(inst);
+              inst1_set.insert(cast<CallInst>(inst));
             }
             if(inst == operand2) {
-              inst2_set.insert(inst);
+              inst2_set.insert(cast<CallInst>(inst));
             }
             break;
           }
           case CAT_SET:
-          case PHI:
           {
-            if(inst->getOperand(0) == operand1) {
-              inst1_set.insert(inst);
+            if(cast<CallInst>(inst)->getOperand(0) == operand1) {
+              inst1_set.insert(cast<CallInst>(inst));
             }
-            if(inst->getOperand(0) == operand2) {
-              inst2_set.insert(inst);
+            if(cast<CallInst>(inst)->getOperand(0) == operand2) {
+              inst2_set.insert(cast<CallInst>(inst));
             }
             break;
           }
           case CAT_ADD:
           case CAT_SUB:
           {
-            if(inst->getOperand(0) == operand1 || inst->getOperand(0) == operand2) return;
+            if(cast<CallInst>(inst)->getOperand(0) == operand1 || cast<CallInst>(inst)->getOperand(0) == operand2) return;
             break;
           }
+          case ARG:
+            return;
           default:
             break;
         }
@@ -568,74 +706,100 @@ namespace {
       }
 
       if(constants.size() == 1) {
-        IRBuilder<> builder(callInst->getNextNode());
+        l.lock();
+        IRBuilder<> builder(callInst);
         auto call = builder.CreateCall(callInst->getModule()->getFunction("CAT_set"), {
           callInst->getOperand(0),
           ConstantInt::get(IntegerType::get(callInst->getModule()->getContext(), 64), *constants.begin()),
         });
         catType[call] = CAT_SET;
         delList.push(callInst);
-      }
+        l.unlock();
+      } 
     }
 
     void CAT_GETPropagation(CallInst *callInst) {
       auto in = ins[callInst];
       std::set<int64_t> constants;
       auto operand0 = callInst->getOperand(0);
+      if(isa<PHINode>(operand0)) {
+        auto phi_set = phiNodeFolding(cast<PHINode>(operand0));
+        set_union(constants.begin(), constants.end(), phi_set.begin(), phi_set.end(), inserter(constants, constants.begin()));
+      }
+
       for(auto &inst : in) {
         switch(catType[inst]) {
           case CAT_NEW:
           {
-            if(inst == operand0 && isa<ConstantInt>(inst->getOperand(0))) {
-              constants.insert(cast<ConstantInt>(inst->getOperand(0))->getSExtValue());
+            auto call = cast<CallInst>(inst);
+            if(inst == operand0 && isa<ConstantInt>(call->getOperand(0))) {
+              constants.insert(cast<ConstantInt>(call->getOperand(0))->getSExtValue());
             }
             break;
           }
           case CAT_SET:
           {
-            if(inst->getOperand(0) == operand0 && isa<ConstantInt>(inst->getOperand(1))) {
-              constants.insert(cast<ConstantInt>(inst->getOperand(1))->getSExtValue());
+            auto call = cast<CallInst>(inst);
+            if(isa<Argument>(call->getOperand(0)) && in.count(call->getOperand(0))) return;
+            if(call->getOperand(0) == operand0 && isa<ConstantInt>(call->getOperand(1))) {
+              constants.insert(cast<ConstantInt>(call->getOperand(1))->getSExtValue());
             }
             break;
           }
           case CAT_ADD:
-          case CAT_SUB:
-            if(inst->getOperand(0) == operand0) return;
+          case CAT_SUB: 
+          {
+            auto call = cast<CallInst>(inst);
+            if(call->getOperand(0) == operand0) return;
             break;
+          }
           default:
             break;
         }
       }
+      std::unique_lock<std::mutex> l(deleteLock);
       if(constants.size() == 1) {
         callInst->replaceAllUsesWith(
           ConstantInt::get(IntegerType::get(callInst->getModule()->getContext(), 64), *constants.begin()));
         delList.push(callInst);
       }
+      l.unlock();
     }
 
-
+    std::mutex deleteLock;
     void doConstantPropagation(Function &F) {
       std::queue<Instruction*> instList;
+      std::queue<std::thread*> threadList;
       for(auto &inst : instructions(F)) {
         instList.push(&inst);
       }
       while(!instList.empty()) {
         auto inst = instList.front();
         instList.pop();
-        switch(catType[inst]) {
-          case CAT_SET:
-            CAT_SETPropagation(cast<CallInst>(inst));
-            break;
-          case CAT_ADD:
-          case CAT_SUB:
-            CATFolding(cast<CallInst>(inst));
-            break;
-          case CAT_GET:
-            CAT_GETPropagation(cast<CallInst>(inst));
-            break;
-          default:
-            break;
-        }
+        std::function task = [&](Instruction *inst){
+          switch(catType[inst]) {
+            case CAT_SET:
+              CAT_SETPropagation(cast<CallInst>(inst));
+              break;
+            case CAT_ADD:
+            case CAT_SUB:
+              CATFolding(cast<CallInst>(inst));
+              break;
+            case CAT_GET:
+              CAT_GETPropagation(cast<CallInst>(inst));
+              break;
+            default:
+              break;
+          }
+        };
+        std::thread *thread_task = new std::thread(task, inst);
+        threadList.push(thread_task);
+      }
+      while(!threadList.empty()) {
+        auto task = threadList.front();
+        task->join();
+        delete task;
+        threadList.pop();
       }
       while(!delList.empty()) {
         auto inst = delList.front();
