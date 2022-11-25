@@ -359,7 +359,8 @@ namespace {
         case OTHER_ESC:
         case PHI:
         {
-          kill = defSet;
+          gen.insert(inst);
+          set_difference(defSet.begin(), defSet.end(), gen.begin(), gen.end(), inserter(kill, kill.begin()));
           break;
         }
         default:
@@ -605,10 +606,10 @@ namespace {
           case LOAD:
           {
             if(inst == operand1) {
-              inst1_set.insert(cast<CallInst>(inst));
+              inst1_set.insert(cast<Instruction>(inst));
             }
             if(inst == operand2) {
-              inst2_set.insert(cast<CallInst>(inst));
+              inst2_set.insert(cast<Instruction>(inst));
             }
             break;
           }
@@ -654,6 +655,10 @@ namespace {
           case PHI:
           {
             auto phi_constants = phiNodeFolding(cast<PHINode>(inst1));
+            errs() << "phi_constants: \n";
+            for(auto num : phi_constants) {
+              errs() << num << "\n";
+            }
             set_union(constants1.begin(), constants1.end(), phi_constants.begin(), phi_constants.end(), inserter(constants1, constants1.begin()));
             break;
           }
@@ -721,18 +726,21 @@ namespace {
     void CAT_GETPropagation(CallInst *callInst) {
       auto in = ins[callInst];
       std::set<int64_t> constants;
+      std::set<Value*> notConstants;
       auto operand0 = callInst->getOperand(0);
       if(isa<PHINode>(operand0)) {
         auto phi_set = phiNodeFolding(cast<PHINode>(operand0));
         set_union(constants.begin(), constants.end(), phi_set.begin(), phi_set.end(), inserter(constants, constants.begin()));
       }
 
+      int added_in_InSet = 0;
       for(auto &inst : in) {
         switch(catType[inst]) {
           case CAT_NEW:
           {
             auto call = cast<CallInst>(inst);
             if(inst == operand0 && isa<ConstantInt>(call->getOperand(0))) {
+              added_in_InSet++;
               constants.insert(cast<ConstantInt>(call->getOperand(0))->getSExtValue());
             }
             break;
@@ -742,7 +750,10 @@ namespace {
             auto call = cast<CallInst>(inst);
             if(isa<Argument>(call->getOperand(0)) && in.count(call->getOperand(0))) return;
             if(call->getOperand(0) == operand0 && isa<ConstantInt>(call->getOperand(1))) {
+              added_in_InSet++;
               constants.insert(cast<ConstantInt>(call->getOperand(1))->getSExtValue());
+            } else if(call->getOperand(0) == operand0 && isa<Instruction>(call->getOperand(1))) {
+              notConstants.insert(call->getOperand(1));
             }
             break;
           }
@@ -761,6 +772,10 @@ namespace {
       if(constants.size() == 1) {
         callInst->replaceAllUsesWith(
           ConstantInt::get(IntegerType::get(callInst->getModule()->getContext(), 64), *constants.begin()));
+        delList.push(callInst);
+      } else if(added_in_InSet == 0 && notConstants.size() == 1) {
+        callInst->replaceAllUsesWith(
+          *notConstants.begin());
         delList.push(callInst);
       }
       l.unlock();
