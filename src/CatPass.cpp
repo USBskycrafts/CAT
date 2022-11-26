@@ -42,10 +42,11 @@ namespace {
     STORE,
     LOAD,
     OTHER_ESC,
-    ARG
+    ARG,
+    SELECT
   };
 
-  struct CAT : public FunctionPass {
+  struct CAT : public ModulePass {
     static char ID; 
     std::unordered_map<Value*, CAT_Type> catType;
     std::unordered_map<Value*, std::set<Value*>> defSets;
@@ -53,7 +54,7 @@ namespace {
     std::unordered_map<Instruction*, std::set<Value*>> ins, outs;
     std::queue<Instruction*> delList;
     std::unordered_map<Instruction*, std::set<CallInst*>> mayAlias, mustAlias;
-    CAT() : FunctionPass(ID) {}
+    CAT() : ModulePass(ID) {}
     
 
     void setCATType(Instruction *inst) {
@@ -63,6 +64,8 @@ namespace {
         catType[inst] = LOAD;
       } else if(isa<StoreInst>(inst)) {
         catType[inst] = STORE;
+      } else if(isa<SelectInst>(inst)) {
+        catType[inst] = SELECT;
       } else if(isa<CallInst>(inst)) {
         auto callInst = cast<CallInst>(inst);
         auto funName = callInst->getCalledFunction()->getName();
@@ -192,6 +195,25 @@ namespace {
       }
     }
 
+    void setSelectDefSet(SelectInst* sel) {
+      auto &defSet = defSets[sel];
+      for(auto &operand : sel->operands()) {
+        switch(catType[operand]) {
+          case PHI:
+          case CAT_NEW:
+          case ARG:
+          case LOAD:
+          {
+            auto operand_defSet = defSets[operand];
+            set_union(operand_defSet.begin(), operand_defSet.end(), defSet.begin(), defSet.end(), inserter(defSet, defSet.begin()));
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    }
+
     void setDefSets(Function &F) {
       for(auto &inst : instructions(F)) {
         setDefSet(&inst);
@@ -229,7 +251,6 @@ namespace {
     }
 
     void setAlias(Function &F) {
-      AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>().getAAResults();
       std::vector<LoadInst*> loadList;
       std::vector<StoreInst*> storeList;
       for(auto &inst : instructions(F)) {
@@ -239,6 +260,7 @@ namespace {
 
       for(auto loadInst : loadList) {
         for(auto storeInst : storeList) {
+          AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>(*storeInst->getFunction()).getAAResults();
           auto loadAddress = MemoryLocation::get(loadInst);
           auto storeAddress = MemoryLocation::get(storeInst);
           switch(aa.alias(loadAddress, storeAddress)) {
@@ -777,6 +799,8 @@ namespace {
         callInst->replaceAllUsesWith(
           *notConstants.begin());
         delList.push(callInst);
+      } else if(callInst->user_empty()) {
+        delList.push(callInst);
       }
       l.unlock();
     }
@@ -823,6 +847,66 @@ namespace {
       }
     }
 
+
+
+  bool isRecursive(CallInst *callInst) {
+    // errs() << "CHECK " << *callInst << "if it is recursive\n";
+    for(auto &inst : instructions(callInst->getCalledFunction())) {
+      if(!isa<CallInst>(inst)) continue;
+      auto calledCallInst = cast<CallInst>(&inst);
+      if(calledCallInst->getCalledFunction()->getName() == callInst->getCalledFunction()->getName()) {
+        // errs() << *callInst << " is a recursive function.\n";
+        return true;
+      } 
+    }
+    // errs() << *callInst << " is not a recursive function.\n";
+    return false;
+  }
+
+  bool isInlinable(CallInst *callInst) {
+    if(isRecursive(callInst) || catType[callInst] != OTHER_ESC) return false;
+    // errs() << *callInst << " is able to inline\n";
+    return true;
+  }
+
+  bool hasCATOperand(CallInst* callInst) {
+    for(auto &operand : callInst->operands()) {
+      if(auto catInst = dyn_cast<CallInst>(operand)) {
+        switch(catType[catInst]) {
+          // errs() << *callInst << " has CAT instruction\n";
+          case CAT_ADD:
+          case CAT_SUB:
+          case CAT_NEW:
+          case CAT_SET:
+            return true;
+          default:
+            break;
+        }
+      }
+    }
+    return false;
+  }
+
+  void inlinePropagation(Module &M) {
+    std::unordered_set<CallBase *> inlineList;
+    for (auto &F : M) {
+      for (auto &inst : instructions(F)) {
+        if (auto callInst = dyn_cast<CallInst>(&inst)) {
+          if (isInlinable(callInst)) {
+            inlineList.insert(callInst);
+            // errs() << *callInst << " is inlined\n";
+          }
+        }
+      }
+    }
+
+    for (auto callInst : inlineList) {
+      InlineFunctionInfo ini;
+      InlineFunction(*callInst, ini);
+    }
+  }
+
+
     // This function is invoked once at the initialization phase of the compiler
     // The LLVM IR of functions isn't ready at this point
     bool doInitialization (Module &M) override {
@@ -831,18 +915,33 @@ namespace {
 
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
-    bool runOnFunction (Function &F) override {
-      // for(auto &F : M) {
+    bool runOnModule (Module &M) override {
+      
+      for(auto &F : M) {
         setCATTypes(F);
+      }
+
+
+      for(auto &F : M) {
         setDefSets(F);
         setAlias(F);
-      // }
-      // for(auto &F : M)  {
+      }
+
+      for(auto &F : M)  {
+        errs() << "before mod: \n";
+        errs() << F << "\n";
         setGensAndKills(F);
         setInsAndOuts(F);
         //printInsAndOuts(F);
+      }
+
+
+      inlinePropagation(M);
+      for(auto &F : M) {
         doConstantPropagation(F);
-      // }
+        errs() << "after mod: \n";
+        errs() << F << "\n";
+      }
       return false;
     }
 
