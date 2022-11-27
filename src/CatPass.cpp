@@ -17,12 +17,15 @@
 #include "llvm/Analysis/AliasAnalysis.h"
 #include <climits>
 #include <concepts>
+#include <sched.h>
 #include <set>
 #include <unordered_set>
 #include <vector>
 #include <map>
 #include <unordered_map>
 #include <thread>
+#include <pthread.h>
+#include <unistd.h>
 
 
 #define DEBUG
@@ -391,16 +394,8 @@ namespace {
     }
 
     void setGensAndKills(Function &F) {
-      std::queue<std::thread*> thread_list;
       for(auto &inst : instructions(F)) {
-        std::thread *task = new std::thread(&CAT::setGenAndKill, this, &inst);
-        thread_list.push(task);
-      }
-      while(!thread_list.empty()) {
-        auto task = thread_list.front();
-        task->join();
-        delete(task);
-        thread_list.pop();
+        setGenAndKill(&inst);
       }
     }
 
@@ -602,8 +597,8 @@ namespace {
     void CATFolding(CallInst* callInst) {
       auto operand1 = callInst->getOperand(1), operand2 = callInst->getOperand(2);
       auto in = ins[callInst];
-      std::set<int64_t> constants1, constants2;
-      std::set<Instruction*> inst1_set, inst2_set;
+      std::unordered_set<int64_t> constants1, constants2;
+      std::unordered_set<Instruction*> inst1_set, inst2_set;
       std::unique_lock<std::mutex> l(deleteLock);
       l.unlock();
 
@@ -677,10 +672,6 @@ namespace {
           case PHI:
           {
             auto phi_constants = phiNodeFolding(cast<PHINode>(inst1));
-            errs() << "phi_constants: \n";
-            for(auto num : phi_constants) {
-              errs() << num << "\n";
-            }
             set_union(constants1.begin(), constants1.end(), phi_constants.begin(), phi_constants.end(), inserter(constants1, constants1.begin()));
             break;
           }
@@ -747,8 +738,8 @@ namespace {
 
     void CAT_GETPropagation(CallInst *callInst) {
       auto in = ins[callInst];
-      std::set<int64_t> constants;
-      std::set<Value*> notConstants;
+      std::unordered_set<int64_t> constants;
+      std::unordered_set<Value*> notConstants;
       auto operand0 = callInst->getOperand(0);
       if(isa<PHINode>(operand0)) {
         auto phi_set = phiNodeFolding(cast<PHINode>(operand0));
@@ -805,47 +796,65 @@ namespace {
       l.unlock();
     }
 
-    std::mutex deleteLock;
-    void doConstantPropagation(Function &F) {
-      std::queue<Instruction*> instList;
-      std::queue<std::thread*> threadList;
-      for(auto &inst : instructions(F)) {
-        instList.push(&inst);
-      }
-      while(!instList.empty()) {
-        auto inst = instList.front();
-        instList.pop();
-        std::function task = [&](Instruction *inst){
-          switch(catType[inst]) {
-            case CAT_SET:
-              CAT_SETPropagation(cast<CallInst>(inst));
-              break;
-            case CAT_ADD:
-            case CAT_SUB:
-              CATFolding(cast<CallInst>(inst));
-              break;
-            case CAT_GET:
-              CAT_GETPropagation(cast<CallInst>(inst));
-              break;
-            default:
-              break;
-          }
-        };
-        std::thread *thread_task = new std::thread(task, inst);
-        threadList.push(thread_task);
-      }
-      while(!threadList.empty()) {
-        auto task = threadList.front();
-        task->join();
-        delete task;
-        threadList.pop();
-      }
-      while(!delList.empty()) {
-        auto inst = delList.front();
-        delList.pop();
-        inst->eraseFromParent();
+
+  void CAT_NEWFolding(CallInst *callInst) {
+    auto operand0 = callInst->getOperand(0);
+    std::unordered_set<int64_t> constants;
+    if(catType[operand0] == CAT_GET) {
+      auto &in = ins[cast<CallInst>(operand0)];
+      auto var = cast<CallInst>(operand0)->getOperand(0);
+      for(auto &inst : in) {
+        if(inst == var && catType[inst] == CAT_NEW && isa<ConstantInt>(cast<CallInst>(inst)->getOperand(0))) {
+          auto num = cast<ConstantInt>(cast<CallInst>(inst)->getOperand(0));
+          constants.insert(num->getSExtValue());
+        }
       }
     }
+
+    if(constants.size() == 1) {
+      callInst->setOperand(0, ConstantInt::get(
+        IntegerType::get(callInst->getModule()->getContext(), 64),
+        *constants.begin()));
+    } else if(callInst->use_empty() && checkCatNew == false) {
+      delList.push(callInst);
+    }
+  }
+
+  std::mutex deleteLock, write_lock;
+  void doConstantPropagation(Function &F) {
+    std::queue<Instruction*> instList;
+    for(auto &inst : instructions(F)) {
+      instList.push(&inst);
+    }
+
+
+    while(!instList.empty()) {
+      auto inst = instList.front();
+      instList.pop();
+      switch(catType[inst]) {
+        case CAT_NEW:
+          CAT_NEWFolding(cast<CallInst>(inst));
+          break;
+        case CAT_SET:
+          CAT_SETPropagation(cast<CallInst>(inst));
+          break;
+        case CAT_ADD:
+        case CAT_SUB:
+          CATFolding(cast<CallInst>(inst));
+          break;
+        case CAT_GET:
+          CAT_GETPropagation(cast<CallInst>(inst));
+          break;
+        default:
+          break;
+      }
+    }
+    while(!delList.empty()) {
+      auto inst = delList.front();
+      delList.pop();
+      inst->eraseFromParent();
+    }
+  }
 
 
 
@@ -915,9 +924,12 @@ namespace {
 
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
+    bool checkCatNew = false;
     bool runOnModule (Module &M) override {
       
+      
       for(auto &F : M) {
+        if(F.getName() == "CAT_variables") checkCatNew = true;
         setCATTypes(F);
       }
 
@@ -928,8 +940,6 @@ namespace {
       }
 
       for(auto &F : M)  {
-        errs() << "before mod: \n";
-        errs() << F << "\n";
         setGensAndKills(F);
         setInsAndOuts(F);
         //printInsAndOuts(F);
@@ -939,8 +949,6 @@ namespace {
       inlinePropagation(M);
       for(auto &F : M) {
         doConstantPropagation(F);
-        errs() << "after mod: \n";
-        errs() << F << "\n";
       }
       return false;
     }
