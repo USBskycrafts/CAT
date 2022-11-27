@@ -394,9 +394,28 @@ namespace {
     }
 
     void setGensAndKills(Function &F) {
+      // unsigned int thread_num = std::thread::hardware_concurrency();
+      // std::vector<std::thread> threads(thread_num);
+
+      // unsigned i = 0;
       for(auto &inst : instructions(F)) {
+        // cpu_set_t mask;
+        // CPU_ZERO(&mask);
+        // CPU_SET(i % _SC_NPROCESSORS_CONF, &mask);
+        // std::thread t(&CAT::setGenAndKill, this, &inst);
+        // pthread_setaffinity_np(t.native_handle(), sizeof(mask), &mask);
+        // threads[i++] = std::move(t);
+        // if(i == thread_num) {
+        //   for(unsigned j = 0; j < thread_num; j++) {
+        //     threads[j].join();
+        //   }
+        //   i = 0;
+        // }
         setGenAndKill(&inst);
       }
+      // for(unsigned int j = 0; j < i; j++) {
+      //   threads[j].join();
+      // }
     }
 
 
@@ -820,6 +839,26 @@ namespace {
     }
   }
 
+  void catPropagation(Instruction *inst) {
+    switch(catType[inst]) {
+      case CAT_NEW:
+        CAT_NEWFolding(cast<CallInst>(inst));
+        break;
+      case CAT_SET:
+        CAT_SETPropagation(cast<CallInst>(inst));
+        break;
+      case CAT_ADD:
+      case CAT_SUB:
+        CATFolding(cast<CallInst>(inst));
+        break;
+      case CAT_GET:
+        CAT_GETPropagation(cast<CallInst>(inst));
+        break;
+      default:
+        break;
+    }
+  }
+
   std::mutex deleteLock, write_lock;
   void doConstantPropagation(Function &F) {
     std::queue<Instruction*> instList;
@@ -831,23 +870,7 @@ namespace {
     while(!instList.empty()) {
       auto inst = instList.front();
       instList.pop();
-      switch(catType[inst]) {
-        case CAT_NEW:
-          CAT_NEWFolding(cast<CallInst>(inst));
-          break;
-        case CAT_SET:
-          CAT_SETPropagation(cast<CallInst>(inst));
-          break;
-        case CAT_ADD:
-        case CAT_SUB:
-          CATFolding(cast<CallInst>(inst));
-          break;
-        case CAT_GET:
-          CAT_GETPropagation(cast<CallInst>(inst));
-          break;
-        default:
-          break;
-      }
+      catPropagation(inst);
     }
     while(!delList.empty()) {
       auto inst = delList.front();
