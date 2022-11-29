@@ -26,9 +26,13 @@
 #include <thread>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
+#include <chrono> 
+#include <iostream>
 
 
 #define DEBUG
+// #define COMPETE
 
 using namespace llvm;
 
@@ -46,7 +50,8 @@ namespace {
     LOAD,
     OTHER_ESC,
     ARG,
-    SELECT
+    SELECT,
+    ALLOCA
   };
 
   struct CAT : public ModulePass {
@@ -55,7 +60,7 @@ namespace {
     std::unordered_map<Value*, std::set<Value*>> defSets;
     std::unordered_map<Value*, std::set<Value*>> gens, kills;
     std::unordered_map<Instruction*, std::set<Value*>> ins, outs;
-    std::queue<Instruction*> delList;
+    std::unordered_set<Instruction*> delList;
     std::unordered_map<Instruction*, std::set<CallInst*>> mayAlias, mustAlias;
     CAT() : ModulePass(ID) {}
     
@@ -69,6 +74,8 @@ namespace {
         catType[inst] = STORE;
       } else if(isa<SelectInst>(inst)) {
         catType[inst] = SELECT;
+      } else if(isa<AllocaInst>(inst)) {
+        catType[inst] = ALLOCA;
       } else if(isa<CallInst>(inst)) {
         auto callInst = cast<CallInst>(inst);
         auto funName = callInst->getCalledFunction()->getName();
@@ -170,10 +177,12 @@ namespace {
         {
           auto storeInst = cast<StoreInst>(inst);
           auto val = storeInst->getValueOperand();
+          auto ptr = storeInst->getPointerOperand();
           auto defSet = defSets[val];
           auto store_defSet = defSets[inst];
           set_union(defSet.begin(), defSet.end(), store_defSet.begin(), store_defSet.end(), inserter(store_defSet, store_defSet.begin()));
           defSets[inst] = store_defSet;
+          defSets[ptr].insert(val);
           break;
         }
         default:
@@ -388,6 +397,12 @@ namespace {
           set_difference(defSet.begin(), defSet.end(), gen.begin(), gen.end(), inserter(kill, kill.begin()));
           break;
         }
+        case LOAD:
+        {
+          auto ptr = cast<LoadInst>(inst)->getPointerOperand();
+          if(defSets[ptr].size() == 1) gen = defSets[ptr];
+          break;
+        }
         default:
           break;
       }
@@ -595,7 +610,7 @@ namespace {
           {
             if(operand0 == next->getOperand(0) && next->getOperand(1) != operand0 && next->getOperand(2) != operand0) {
               std::unique_lock<std::mutex> l(deleteLock);
-              delList.push(callInst);
+              delList.insert(callInst);
               l.unlock();
             }
             break;
@@ -603,7 +618,7 @@ namespace {
           case CAT_SET:
             if(operand0 == next->getOperand(0)) {
               std::unique_lock<std::mutex> l(deleteLock);
-              delList.push(callInst);
+              delList.insert(callInst);
               l.unlock();
             }
             break;
@@ -611,6 +626,13 @@ namespace {
             break;
         }
       }
+      
+
+      for(auto user : operand0->users()) {
+        if(catType[user] == CAT_SET) continue;
+        else return;
+      }
+      // delList.insert(callInst);
     }
 
     void CATFolding(CallInst* callInst) {
@@ -629,7 +651,7 @@ namespace {
           ConstantInt::get(IntegerType::get(callInst->getModule()->getContext(), 64), 0),
         });
         catType[call] = CAT_SET;
-        delList.push(callInst);
+        delList.insert(callInst);
         l.unlock();
         return;
       }
@@ -750,9 +772,48 @@ namespace {
           ConstantInt::get(IntegerType::get(callInst->getModule()->getContext(), 64), *constants.begin()),
         });
         catType[call] = CAT_SET;
-        delList.push(callInst);
+        delList.insert(callInst);
         l.unlock();
       } 
+    
+      if(constants1.size() == 1 && isa<Argument>(operand2)) {
+        l.lock();
+        IRBuilder<> builder(callInst);
+        auto const_num = ConstantInt::get(IntegerType::get(callInst->getModule()->getContext(), 64), *constants1.begin());
+        Value *inst_folding;
+        if(catType[callInst] == CAT_ADD)
+          inst_folding = builder.CreateAdd(const_num, operand2);
+        else {
+          inst_folding = builder.CreateSub(const_num, operand2);
+        }
+        auto call = builder.CreateCall(callInst->getModule()->getFunction("CAT_set"), {
+          callInst->getOperand(0),
+          inst_folding,
+        });
+        catType[call] = CAT_SET;
+        delList.insert(callInst);
+        l.unlock();
+      }
+
+
+      if(constants2.size() == 1 && isa<Argument>(operand1)) {
+        l.lock();
+        IRBuilder<> builder(callInst);
+        auto const_num = ConstantInt::get(IntegerType::get(callInst->getModule()->getContext(), 64), *constants2.begin());
+        Value *inst_folding;
+        if(catType[callInst] == CAT_ADD)
+          inst_folding = builder.CreateAdd(operand1, const_num);
+        else {
+          inst_folding = builder.CreateSub(operand1, const_num);
+        }
+        auto call = builder.CreateCall(callInst->getModule()->getFunction("CAT_set"), {
+          callInst->getOperand(0),
+          inst_folding,
+        });
+        catType[call] = CAT_SET;
+        delList.insert(callInst);
+        l.unlock();
+      }
     }
 
     void CAT_GETPropagation(CallInst *callInst) {
@@ -804,13 +865,13 @@ namespace {
       if(constants.size() == 1) {
         callInst->replaceAllUsesWith(
           ConstantInt::get(IntegerType::get(callInst->getModule()->getContext(), 64), *constants.begin()));
-        delList.push(callInst);
+        delList.insert(callInst);
       } else if(added_in_InSet == 0 && notConstants.size() == 1) {
         callInst->replaceAllUsesWith(
           *notConstants.begin());
-        delList.push(callInst);
+        delList.insert(callInst);
       } else if(callInst->user_empty()) {
-        delList.push(callInst);
+        delList.insert(callInst);
       }
       l.unlock();
     }
@@ -835,9 +896,29 @@ namespace {
         IntegerType::get(callInst->getModule()->getContext(), 64),
         *constants.begin()));
     } else if(callInst->use_empty() && checkCatNew == false) {
-      delList.push(callInst);
+      #ifdef COMPETE
+      delList.insert(callInst);
+      #endif
+    }
+
+    std::set<Value*> val_set;
+    std::set<Instruction*> del_user;
+    for(auto user : callInst->users()) {
+      if(catType[user] == CAT_SET && isa<ConstantInt>(user->getOperand(1))) {
+        val_set.insert(user->getOperand(1));
+        del_user.insert(cast<CallInst>(user));
+      } else {
+        return;
+      }
+    }
+    if(val_set.size() == 1) {
+      callInst->setOperand(0, *val_set.begin());
+      for(auto cat_set : del_user) {
+        delList.insert(cat_set);
+      }
     }
   }
+
 
   void catPropagation(Instruction *inst) {
     switch(catType[inst]) {
@@ -872,11 +953,10 @@ namespace {
       instList.pop();
       catPropagation(inst);
     }
-    while(!delList.empty()) {
-      auto inst = delList.front();
-      delList.pop();
+    for(auto inst : delList) {
       inst->eraseFromParent();
     }
+    delList.clear();
   }
 
 
@@ -896,7 +976,7 @@ namespace {
   }
 
   bool isInlinable(CallInst *callInst) {
-    if(isRecursive(callInst) || catType[callInst] != OTHER_ESC) return false;
+    if(isRecursive(callInst) /*|| catType[callInst] != OTHER_ESC*/) return false;
     // errs() << *callInst << " is able to inline\n";
     return true;
   }
